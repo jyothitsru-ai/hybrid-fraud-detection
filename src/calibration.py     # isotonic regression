@@ -1,0 +1,1442 @@
+"""
+calibration.py
+==============
+Post-hoc probability calibration for the hybrid fraud detection framework.
+
+Paper
+-----
+"A Hybrid Deep Learning and Explainable AI Framework for Real-Time
+Financial Fraud Detection in Dynamic Environments"
+
+Why calibration matters for fraud detection
+--------------------------------------------
+The paper's cost-optimal decision rule (Lemma 1) is:
+
+    predict fraud  iff  p_hat(x) >= tau*  where  tau* = c_FP / (c_FP + c_FN)
+
+This rule is only optimal when p_hat(x) is a *calibrated* probability —
+i.e. when P(y=1 | p_hat=0.7) ≈ 0.7 in reality.  An uncalibrated model
+that systematically over- or under-estimates probabilities will shift the
+effective decision boundary away from tau*, degrading recall or precision.
+
+The paper quantifies this in Table 2:
+
+    Dataset      Metric   Pre-calibration   Post-calibration
+    -------------------------------------------------------
+    Credit Card  ECE      6.1%              2.0%
+    Credit Card  Brier    0.048             0.032
+    IEEE-CIS     ECE      7.5%              2.5%
+    PaySim       ECE      5.8%              1.9%
+
+"The calibrated hybrid model was not only superior to the uncalibrated
+variants, but also maintained constant precision with fixed recall across
+folds with time."  (Results Discussion)
+
+"A minor change in probability scores can radically change the
+precision-recall trade-off when prevalence is low."  (Results Discussion)
+
+Calibration methods provided
+-----------------------------
+1.  IsotonicCalibrator  — non-parametric isotonic regression (paper's
+    primary method).  Fit on validation fold; applied at inference time.
+2.  PlattCalibrator     — logistic (Platt) scaling, provided as a
+    comparison baseline.
+3.  TemperatureCalibrator — single scalar temperature T that divides
+    logits before sigmoid; fast and interpretable.
+
+All three implement a common CalibrationBase interface so they can be
+swapped without changing downstream code.
+
+Usage
+-----
+    from src.calibration import IsotonicCalibrator, CalibrationReport
+
+    # Fit on validation fold raw scores
+    cal = IsotonicCalibrator()
+    cal.fit(raw_probs_val, y_val)
+
+    # Apply to test scores
+    calibrated_probs = cal.transform(raw_probs_test)
+
+    # Measure improvement
+    report = CalibrationReport.build(
+        y_true=y_val,
+        probs_before=raw_probs_val,
+        probs_after=calibrated_probs,
+        dataset_name="Credit Card",
+    )
+    print(report.summary())
+    report.plot(save_path="results/figures/calibration_creditcard.png")
+"""
+
+from __future__ import annotations
+
+import logging
+import warnings
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import joblib
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
+import pandas as pd
+from scipy.special import expit as sigmoid
+from scipy.optimize import minimize_scalar
+from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss
+
+warnings.filterwarnings("ignore")
+logger = logging.getLogger(__name__)
+
+# ── Matplotlib style ──────────────────────────────────────────────────────────
+plt.rcParams.update({
+    "figure.dpi"       : 130,
+    "font.family"      : "DejaVu Sans",
+    "axes.spines.top"  : False,
+    "axes.spines.right": False,
+    "axes.grid"        : True,
+    "grid.alpha"       : 0.35,
+    "grid.linestyle"   : "--",
+})
+
+# ── Default cost model ────────────────────────────────────────────────────────
+DEFAULT_COST_FN: float = 100.0
+DEFAULT_COST_FP: float = 1.0
+
+# ── ECE bins ──────────────────────────────────────────────────────────────────
+DEFAULT_N_BINS: int = 10
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Standalone metric functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def expected_calibration_error(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = DEFAULT_N_BINS,
+    strategy: str = "uniform",
+) -> float:
+    """Expected Calibration Error (ECE) as a percentage.
+
+    ECE measures the average gap between predicted confidence and observed
+    accuracy across probability bins:
+
+        ECE = sum_b (|B_b| / N) * |acc_b - conf_b|
+
+    where B_b are the samples in bin b, acc_b is the fraction of true
+    positives in bin b, and conf_b is the mean predicted probability.
+
+    Paper Table 2 target values:
+        Credit Card:  pre=6.1%  post=2.0%
+        IEEE-CIS:     pre=7.5%  post=2.5%
+        PaySim:       pre=5.8%  post=1.9%
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (N,)
+        Binary ground-truth labels (0=legit, 1=fraud).
+    y_prob : np.ndarray, shape (N,)
+        Predicted fraud probabilities in [0, 1].
+    n_bins : int, default 10
+        Number of probability bins.
+    strategy : {"uniform", "quantile"}, default "uniform"
+        "uniform"  — equal-width bins over [0, 1].
+        "quantile" — bins with equal numbers of samples (better for
+                     skewed score distributions in imbalanced data).
+
+    Returns
+    -------
+    float
+        ECE as a percentage (e.g. 6.1 means 6.1%).
+    """
+    y_true = np.asarray(y_true).ravel()
+    y_prob = np.asarray(y_prob).ravel()
+
+    if strategy == "uniform":
+        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    elif strategy == "quantile":
+        bin_edges = np.quantile(y_prob, np.linspace(0.0, 1.0, n_bins + 1))
+        bin_edges = np.unique(bin_edges)  # deduplicate
+    else:
+        raise ValueError(f"strategy must be 'uniform' or 'quantile', got {strategy!r}.")
+
+    ece = 0.0
+    n   = len(y_true)
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi)
+        if mask.sum() == 0:
+            continue
+        acc  = float(y_true[mask].mean())
+        conf = float(y_prob[mask].mean())
+        ece += (mask.sum() / n) * abs(acc - conf)
+
+    return ece * 100.0
+
+
+def maximum_calibration_error(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = DEFAULT_N_BINS,
+) -> float:
+    """Maximum Calibration Error (MCE) as a percentage.
+
+    MCE is the *worst-case* bin-level miscalibration, complementing ECE's
+    average-case view:
+
+        MCE = max_b |acc_b - conf_b|
+
+    Useful for identifying specific probability regions where the model is
+    systematically wrong — which matters in fraud because decisions near
+    tau* are the most sensitive to miscalibration.
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (N,)
+    y_prob : np.ndarray, shape (N,)
+    n_bins : int, default 10
+
+    Returns
+    -------
+    float
+        MCE as a percentage.
+    """
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    mce = 0.0
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi)
+        if mask.sum() == 0:
+            continue
+        acc  = float(y_true[mask].mean())
+        conf = float(y_prob[mask].mean())
+        mce  = max(mce, abs(acc - conf))
+    return mce * 100.0
+
+
+def overconfidence_score(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = DEFAULT_N_BINS,
+) -> float:
+    """Signed ECE: positive means overconfident, negative means underconfident.
+
+    A model predicting fraud too confidently (conf > acc) will place the
+    effective operating point above tau*, pushing recall down.  A model
+    that is underconfident will place the operating point below tau*,
+    increasing false alarms.  This score makes the direction explicit.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+    y_prob : np.ndarray
+    n_bins : int
+
+    Returns
+    -------
+    float
+        Signed calibration gap (%).  Positive = overconfident.
+    """
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    signed_ece = 0.0
+    n = len(y_true)
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi)
+        if mask.sum() == 0:
+            continue
+        acc  = float(y_true[mask].mean())
+        conf = float(y_prob[mask].mean())
+        signed_ece += (mask.sum() / n) * (conf - acc)   # positive = over
+    return signed_ece * 100.0
+
+
+def reliability_curve(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = DEFAULT_N_BINS,
+    strategy: str = "uniform",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute reliability curve data (fraction of positives vs mean confidence).
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+    y_prob : np.ndarray
+    n_bins : int
+    strategy : str
+
+    Returns
+    -------
+    fraction_of_positives : np.ndarray
+        Observed fraud rate per bin (y-axis of reliability diagram).
+    mean_predicted : np.ndarray
+        Mean predicted probability per bin (x-axis).
+    bin_counts : np.ndarray
+        Number of samples per bin (for bar histogram overlay).
+    """
+    frac_pos, mean_pred = calibration_curve(
+        y_true, y_prob, n_bins=n_bins, strategy=strategy
+    )
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_counts = np.array([
+        int(((y_prob >= lo) & (y_prob < hi)).sum())
+        for lo, hi in zip(bin_edges[:-1], bin_edges[1:])
+    ])
+    return frac_pos, mean_pred, bin_counts
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Abstract base class
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class CalibrationBase(ABC):
+    """Abstract interface shared by all calibrators in this module.
+
+    Subclasses must implement :meth:`fit` and :meth:`transform`.
+    The :meth:`fit_transform` convenience method is provided here.
+    """
+
+    #: Short human-readable name used in reports and plots.
+    name: str = "base"
+
+    @abstractmethod
+    def fit(self, raw_probs: np.ndarray, y_true: np.ndarray) -> "CalibrationBase":
+        """Fit the calibrator on raw scores and ground-truth labels.
+
+        Parameters
+        ----------
+        raw_probs : np.ndarray, shape (N,)
+            Uncalibrated fraud probabilities from the ensemble head.
+        y_true : np.ndarray, shape (N,)
+            Binary ground-truth labels.
+
+        Returns
+        -------
+        self
+        """
+
+    @abstractmethod
+    def transform(self, raw_probs: np.ndarray) -> np.ndarray:
+        """Map raw probabilities to calibrated probabilities.
+
+        Parameters
+        ----------
+        raw_probs : np.ndarray, shape (N,)
+
+        Returns
+        -------
+        np.ndarray, shape (N,)
+            Calibrated probabilities in [0, 1].
+        """
+
+    def fit_transform(
+        self,
+        raw_probs: np.ndarray,
+        y_true: np.ndarray,
+    ) -> np.ndarray:
+        """Fit and immediately transform the same data.
+
+        Convenience wrapper: fits the calibrator and returns calibrated
+        probabilities in one call.
+
+        Parameters
+        ----------
+        raw_probs : np.ndarray, shape (N,)
+        y_true : np.ndarray, shape (N,)
+
+        Returns
+        -------
+        np.ndarray, shape (N,)
+        """
+        return self.fit(raw_probs, y_true).transform(raw_probs)
+
+    @abstractmethod
+    def save(self, path: str | Path) -> None:
+        """Persist the fitted calibrator to disk."""
+
+    @classmethod
+    @abstractmethod
+    def load(cls, path: str | Path) -> "CalibrationBase":
+        """Load a saved calibrator from disk."""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Calibrator implementations
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class IsotonicCalibrator(CalibrationBase):
+    """Post-hoc isotonic regression calibration — the paper's primary method.
+
+    Isotonic regression fits a non-decreasing step function mapping
+    raw scores to empirical fraud rates.  It is non-parametric and makes
+    no distributional assumptions, making it robust to the severe class
+    imbalance in fraud data.
+
+    Paper reference:
+        "An isotonic regressor with the latest validation window is used
+        to score-calibrate the scores so they match the observed
+        frequencies."  (Proposed Architecture section)
+
+        "Calibrating the probability post-hoc based on isotonic regression
+        that was trained on the validation folds was a vital step of the
+        pipeline."  (Experimental Datasets section)
+
+        "isotonic regression reduced the predicted error of calibration by
+        more than six to less than two percent in all four datasets."
+        (Results Discussion)
+
+    Parameters
+    ----------
+    out_of_bounds : {"clip", "raise", "nan"}, default "clip"
+        Behaviour when transform() receives scores outside the training
+        range.  "clip" clamps to [min_train, max_train] — recommended for
+        production where score distributions can shift.
+    """
+
+    name = "isotonic"
+
+    def __init__(self, out_of_bounds: str = "clip") -> None:
+        self.out_of_bounds = out_of_bounds
+        self._iso: Optional[IsotonicRegression] = None
+
+    def fit(
+        self,
+        raw_probs: np.ndarray,
+        y_true: np.ndarray,
+    ) -> "IsotonicCalibrator":
+        """Fit isotonic regression on validation fold raw scores.
+
+        Parameters
+        ----------
+        raw_probs : np.ndarray, shape (N,)
+            Uncalibrated fraud probabilities.
+        y_true : np.ndarray, shape (N,)
+            Binary labels.
+
+        Returns
+        -------
+        self
+        """
+        raw_probs = np.asarray(raw_probs, dtype=np.float64).ravel()
+        y_true    = np.asarray(y_true,    dtype=np.float64).ravel()
+
+        if len(raw_probs) != len(y_true):
+            raise ValueError(
+                f"raw_probs length {len(raw_probs)} != y_true length {len(y_true)}."
+            )
+        if y_true.sum() == 0:
+            raise ValueError("y_true contains no positive (fraud) labels.")
+
+        self._iso = IsotonicRegression(
+            out_of_bounds=self.out_of_bounds,
+            increasing=True,
+        )
+        self._iso.fit(raw_probs, y_true)
+        logger.info(
+            "IsotonicCalibrator fitted on %d samples  "
+            "(fraud=%.3f%%  score_range=[%.4f, %.4f])",
+            len(raw_probs),
+            y_true.mean() * 100,
+            raw_probs.min(),
+            raw_probs.max(),
+        )
+        return self
+
+    def transform(self, raw_probs: np.ndarray) -> np.ndarray:
+        """Apply fitted isotonic mapping to new raw scores.
+
+        Parameters
+        ----------
+        raw_probs : np.ndarray, shape (N,)
+
+        Returns
+        -------
+        np.ndarray, shape (N,)
+            Calibrated probabilities clipped to [0, 1].
+        """
+        if self._iso is None:
+            raise RuntimeError("IsotonicCalibrator has not been fitted. Call fit() first.")
+        raw_probs = np.asarray(raw_probs, dtype=np.float64).ravel()
+        cal = self._iso.predict(raw_probs)
+        return np.clip(cal, 0.0, 1.0).astype(np.float32)
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"calibrator": self._iso, "out_of_bounds": self.out_of_bounds}, path)
+        logger.info("IsotonicCalibrator saved to %s", path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "IsotonicCalibrator":
+        ckpt = joblib.load(path)
+        obj  = cls(out_of_bounds=ckpt["out_of_bounds"])
+        obj._iso = ckpt["calibrator"]
+        logger.info("IsotonicCalibrator loaded from %s", path)
+        return obj
+
+    def __repr__(self) -> str:
+        fitted = self._iso is not None
+        return f"IsotonicCalibrator(fitted={fitted}, out_of_bounds={self.out_of_bounds!r})"
+
+
+class PlattCalibrator(CalibrationBase):
+    """Platt scaling (logistic calibration) for comparison with isotonic.
+
+    Fits a two-parameter logistic function a*s + b to map raw scores s
+    to calibrated probabilities p = sigma(a*s + b).  More parametric
+    and less flexible than isotonic regression; provided as a baseline
+    comparator.
+
+    Paper: "Post-hoc calibration (e.g., isotonic or Platt scaling on a
+    validation stream) yields p_tilde(x) close to P(A|B)."
+    (Calibration and operating point section)
+
+    Parameters
+    ----------
+    C : float, default 1.0
+        Inverse regularisation strength for the underlying logistic
+        regression.  Smaller values = stronger regularisation.
+    """
+
+    name = "platt"
+
+    def __init__(self, C: float = 1.0) -> None:
+        self.C = C
+        self._lr: Optional[LogisticRegression] = None
+
+    def fit(self, raw_probs: np.ndarray, y_true: np.ndarray) -> "PlattCalibrator":
+        """Fit logistic regression on raw scores.
+
+        Parameters
+        ----------
+        raw_probs : np.ndarray, shape (N,)
+        y_true : np.ndarray, shape (N,)
+
+        Returns
+        -------
+        self
+        """
+        raw_probs = np.asarray(raw_probs).ravel().reshape(-1, 1)
+        y_true    = np.asarray(y_true).ravel()
+
+        self._lr = LogisticRegression(C=self.C, solver="lbfgs", max_iter=1000)
+        self._lr.fit(raw_probs, y_true)
+        logger.info(
+            "PlattCalibrator fitted.  a=%.4f  b=%.4f",
+            float(self._lr.coef_[0][0]),
+            float(self._lr.intercept_[0]),
+        )
+        return self
+
+    def transform(self, raw_probs: np.ndarray) -> np.ndarray:
+        if self._lr is None:
+            raise RuntimeError("PlattCalibrator has not been fitted. Call fit() first.")
+        X = np.asarray(raw_probs).ravel().reshape(-1, 1)
+        return self._lr.predict_proba(X)[:, 1].astype(np.float32)
+
+    @property
+    def coef_a(self) -> float:
+        """Platt scaling slope parameter a."""
+        return float(self._lr.coef_[0][0]) if self._lr else float("nan")
+
+    @property
+    def coef_b(self) -> float:
+        """Platt scaling intercept parameter b."""
+        return float(self._lr.intercept_[0]) if self._lr else float("nan")
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"lr": self._lr, "C": self.C}, path)
+        logger.info("PlattCalibrator saved to %s", path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "PlattCalibrator":
+        ckpt = joblib.load(path)
+        obj  = cls(C=ckpt["C"])
+        obj._lr = ckpt["lr"]
+        return obj
+
+    def __repr__(self) -> str:
+        if self._lr is not None:
+            return f"PlattCalibrator(a={self.coef_a:.4f}, b={self.coef_b:.4f}, C={self.C})"
+        return f"PlattCalibrator(fitted=False, C={self.C})"
+
+
+class TemperatureCalibrator(CalibrationBase):
+    """Temperature scaling — a single-parameter calibration method.
+
+    Divides the pre-sigmoid logit by a learned scalar temperature T:
+
+        p_cal = sigma(logit(s) / T)
+
+    T > 1 softens (reduces overconfidence); T < 1 sharpens predictions.
+    Very fast at inference time (one division) and easy to audit — useful
+    for the paper's real-time serving context where SHAP is generated
+    asynchronously while the fraud decision must meet single-digit
+    millisecond latency.
+
+    Parameters
+    ----------
+    init_T : float, default 1.5
+        Initial temperature before optimisation.
+    """
+
+    name = "temperature"
+
+    def __init__(self, init_T: float = 1.5) -> None:
+        self.init_T = init_T
+        self.T_: Optional[float] = None
+
+    def fit(
+        self,
+        raw_probs: np.ndarray,
+        y_true: np.ndarray,
+    ) -> "TemperatureCalibrator":
+        """Fit temperature T by minimising negative log-likelihood.
+
+        Parameters
+        ----------
+        raw_probs : np.ndarray, shape (N,)
+        y_true : np.ndarray, shape (N,)
+
+        Returns
+        -------
+        self
+        """
+        raw_probs = np.asarray(raw_probs, dtype=np.float64).ravel()
+        y_true    = np.asarray(y_true,    dtype=np.float64).ravel()
+
+        # Convert probabilities back to logits: logit(p) = log(p / (1-p))
+        eps    = 1e-7
+        logits = np.log(
+            np.clip(raw_probs, eps, 1 - eps)
+            / np.clip(1 - raw_probs, eps, 1 - eps)
+        )
+
+        def nll(T: float) -> float:
+            """Negative log-likelihood under temperature T."""
+            if T <= 0:
+                return 1e12
+            p_cal = sigmoid(logits / T)
+            p_cal = np.clip(p_cal, eps, 1 - eps)
+            return -float(
+                (y_true * np.log(p_cal) + (1 - y_true) * np.log(1 - p_cal)).mean()
+            )
+
+        result  = minimize_scalar(nll, bounds=(0.01, 20.0), method="bounded")
+        self.T_ = float(result.x)
+
+        logger.info(
+            "TemperatureCalibrator fitted.  T=%.4f  (init=%.4f)",
+            self.T_, self.init_T,
+        )
+        return self
+
+    def transform(self, raw_probs: np.ndarray) -> np.ndarray:
+        if self.T_ is None:
+            raise RuntimeError(
+                "TemperatureCalibrator has not been fitted. Call fit() first."
+            )
+        raw_probs = np.asarray(raw_probs, dtype=np.float64).ravel()
+        eps    = 1e-7
+        logits = np.log(
+            np.clip(raw_probs, eps, 1 - eps)
+            / np.clip(1 - raw_probs, eps, 1 - eps)
+        )
+        return sigmoid(logits / self.T_).astype(np.float32)
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"T": self.T_, "init_T": self.init_T}, path)
+        logger.info("TemperatureCalibrator saved to %s (T=%.4f)", path, self.T_)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "TemperatureCalibrator":
+        ckpt = joblib.load(path)
+        obj  = cls(init_T=ckpt["init_T"])
+        obj.T_ = ckpt["T"]
+        return obj
+
+    def __repr__(self) -> str:
+        return (
+            f"TemperatureCalibrator("
+            f"T={self.T_ if self.T_ is not None else 'unfitted'}, "
+            f"init_T={self.init_T})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CalibrationReport — structured result object
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class CalibrationReport:
+    """Structured calibration analysis result for a single fold/dataset.
+
+    Captures all metrics from Table 2 plus additional diagnostics and
+    provides plotting and serialisation methods.
+
+    Attributes
+    ----------
+    dataset_name : str
+        Human-readable dataset identifier (e.g. "Credit Card", "IEEE-CIS").
+    calibrator_name : str
+        Name of the calibrator used.
+    n_samples : int
+        Number of validation samples evaluated.
+    fraud_rate : float
+        Observed fraud rate in the validation set.
+    ece_before : float
+        ECE (%) using raw uncalibrated scores.
+    ece_after : float
+        ECE (%) using calibrated scores.
+    mce_before : float
+        MCE (%) before calibration.
+    mce_after : float
+        MCE (%) after calibration.
+    brier_before : float
+        Brier score before calibration.
+    brier_after : float
+        Brier score after calibration.
+    overconf_before : float
+        Signed overconfidence (%) before calibration.
+    overconf_after : float
+        Signed overconfidence (%) after calibration.
+    roc_auc_preserved : bool
+        Whether ROC-AUC was preserved within 0.001 after calibration
+        (paper: "calibration preserves AUC").
+    """
+
+    dataset_name       : str   = ""
+    calibrator_name    : str   = "isotonic"
+    n_samples          : int   = 0
+    fraud_rate         : float = 0.0
+    ece_before         : float = 0.0
+    ece_after          : float = 0.0
+    mce_before         : float = 0.0
+    mce_after          : float = 0.0
+    brier_before       : float = 0.0
+    brier_after        : float = 0.0
+    overconf_before    : float = 0.0
+    overconf_after     : float = 0.0
+    roc_auc_preserved  : bool  = True
+    # Raw arrays — not stored in summary dict but used for plotting
+    _y_true           : Optional[np.ndarray] = field(default=None, repr=False)
+    _probs_before     : Optional[np.ndarray] = field(default=None, repr=False)
+    _probs_after      : Optional[np.ndarray] = field(default=None, repr=False)
+
+    @classmethod
+    def build(
+        cls,
+        y_true: np.ndarray,
+        probs_before: np.ndarray,
+        probs_after: np.ndarray,
+        dataset_name: str = "",
+        calibrator_name: str = "isotonic",
+        n_bins: int = DEFAULT_N_BINS,
+    ) -> "CalibrationReport":
+        """Construct a CalibrationReport from arrays.
+
+        Parameters
+        ----------
+        y_true : np.ndarray, shape (N,)
+            Binary ground-truth labels.
+        probs_before : np.ndarray, shape (N,)
+            Raw (uncalibrated) fraud probabilities.
+        probs_after : np.ndarray, shape (N,)
+            Calibrated fraud probabilities.
+        dataset_name : str
+        calibrator_name : str
+        n_bins : int
+
+        Returns
+        -------
+        CalibrationReport
+        """
+        from sklearn.metrics import roc_auc_score  # local import to avoid circulars
+        auc_before = roc_auc_score(y_true, probs_before)
+        auc_after  = roc_auc_score(y_true, probs_after)
+
+        report = cls(
+            dataset_name    = dataset_name,
+            calibrator_name = calibrator_name,
+            n_samples       = int(len(y_true)),
+            fraud_rate      = float(y_true.mean() * 100),
+            ece_before      = expected_calibration_error(y_true, probs_before, n_bins),
+            ece_after       = expected_calibration_error(y_true, probs_after,  n_bins),
+            mce_before      = maximum_calibration_error(y_true, probs_before, n_bins),
+            mce_after       = maximum_calibration_error(y_true, probs_after,  n_bins),
+            brier_before    = float(brier_score_loss(y_true, probs_before)),
+            brier_after     = float(brier_score_loss(y_true, probs_after)),
+            overconf_before = overconfidence_score(y_true, probs_before, n_bins),
+            overconf_after  = overconfidence_score(y_true, probs_after,  n_bins),
+            roc_auc_preserved = abs(auc_before - auc_after) < 0.001,
+        )
+        # Attach arrays for plotting
+        report._y_true       = np.asarray(y_true)
+        report._probs_before = np.asarray(probs_before)
+        report._probs_after  = np.asarray(probs_after)
+        return report
+
+    @property
+    def ece_improvement(self) -> float:
+        """Absolute ECE reduction in percentage points."""
+        return self.ece_before - self.ece_after
+
+    @property
+    def brier_improvement(self) -> float:
+        """Absolute Brier score reduction."""
+        return self.brier_before - self.brier_after
+
+    def summary(self) -> str:
+        """Multi-line human-readable summary matching Table 2 format."""
+        auc_note = "AUC preserved" if self.roc_auc_preserved else "AUC CHANGED"
+        return (
+            f"CalibrationReport — {self.dataset_name} [{self.calibrator_name}]\n"
+            f"  Samples : {self.n_samples:,}  |  Fraud rate: {self.fraud_rate:.3f}%\n"
+            f"  ECE     : {self.ece_before:.2f}% → {self.ece_after:.2f}%  "
+            f"(Δ = -{self.ece_improvement:.2f}pp)\n"
+            f"  MCE     : {self.mce_before:.2f}% → {self.mce_after:.2f}%\n"
+            f"  Brier   : {self.brier_before:.4f} → {self.brier_after:.4f}  "
+            f"(Δ = -{self.brier_improvement:.4f})\n"
+            f"  Overconf: {self.overconf_before:+.2f}% → {self.overconf_after:+.2f}%  "
+            f"| {auc_note}"
+        )
+
+    def to_dict(self) -> Dict[str, float]:
+        """Serialise numeric metrics to a flat dictionary."""
+        return {
+            "dataset"         : self.dataset_name,
+            "calibrator"      : self.calibrator_name,
+            "n_samples"       : self.n_samples,
+            "fraud_rate_pct"  : round(self.fraud_rate, 4),
+            "ece_before_pct"  : round(self.ece_before, 4),
+            "ece_after_pct"   : round(self.ece_after,  4),
+            "ece_delta_pp"    : round(self.ece_improvement, 4),
+            "mce_before_pct"  : round(self.mce_before, 4),
+            "mce_after_pct"   : round(self.mce_after,  4),
+            "brier_before"    : round(self.brier_before, 6),
+            "brier_after"     : round(self.brier_after,  6),
+            "brier_delta"     : round(self.brier_improvement, 6),
+            "overconf_before" : round(self.overconf_before, 4),
+            "overconf_after"  : round(self.overconf_after,  4),
+            "roc_auc_preserved": int(self.roc_auc_preserved),
+        }
+
+    # ── Plotting ──────────────────────────────────────────────────────────────
+
+    def plot(
+        self,
+        save_path: Optional[str | Path] = None,
+        show: bool = True,
+        n_bins: int = DEFAULT_N_BINS,
+    ) -> plt.Figure:
+        """Plot a four-panel calibration analysis figure (Figure 3 style).
+
+        Panels
+        ------
+        1. Reliability diagram — before calibration
+        2. Reliability diagram — after calibration
+        3. Score histogram overlay (fraud vs. legitimate, before/after)
+        4. ECE and Brier score comparison bar chart
+
+        Parameters
+        ----------
+        save_path : str or Path, optional
+            If provided, save the figure to this path.
+        show : bool, default True
+        n_bins : int, default 10
+
+        Returns
+        -------
+        plt.Figure
+        """
+        if self._y_true is None:
+            raise RuntimeError(
+                "No raw arrays attached to this report.  Use CalibrationReport.build()."
+            )
+
+        y, pb, pa = self._y_true, self._probs_before, self._probs_after
+
+        fig = plt.figure(figsize=(14, 10))
+        fig.suptitle(
+            f"Calibration Analysis — {self.dataset_name}  [{self.calibrator_name}]\n"
+            f"ECE: {self.ece_before:.2f}% → {self.ece_after:.2f}%  |  "
+            f"Brier: {self.brier_before:.4f} → {self.brier_after:.4f}",
+            fontsize=12, fontweight="bold",
+        )
+        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32)
+
+        # ── Panel 1: Reliability diagram (before) ─────────────────────────────
+        ax1 = fig.add_subplot(gs[0, 0])
+        self._draw_reliability_diagram(
+            ax1, y, pb, n_bins,
+            title=f"Reliability Diagram — Before\n(ECE={self.ece_before:.2f}%)",
+            colour="#E63946",
+        )
+
+        # ── Panel 2: Reliability diagram (after) ──────────────────────────────
+        ax2 = fig.add_subplot(gs[0, 1])
+        self._draw_reliability_diagram(
+            ax2, y, pa, n_bins,
+            title=f"Reliability Diagram — After\n(ECE={self.ece_after:.2f}%)",
+            colour="#2DC653",
+        )
+
+        # ── Panel 3: Score distribution overlay ───────────────────────────────
+        ax3 = fig.add_subplot(gs[1, 0])
+        for probs, label, ls in [(pb, "Before cal.", "--"), (pa, "After cal.", "-")]:
+            for cls, colour, name in [(0, "#2E86AB", "Legit"), (1, "#E63946", "Fraud")]:
+                mask = y == cls
+                ax3.hist(
+                    probs[mask], bins=50, alpha=0.4 if cls == 0 else 0.7,
+                    density=True, color=colour, linestyle=ls,
+                    label=f"{name} ({label})", histtype="stepfilled" if cls == 1 else "step",
+                )
+        ax3.set_xlabel("Predicted fraud probability")
+        ax3.set_ylabel("Density")
+        ax3.set_title("Score Distribution — Fraud vs. Legitimate")
+        ax3.legend(fontsize=7, ncol=2)
+        ax3.set_xlim(0, 1)
+
+        # ── Panel 4: Metric comparison bar chart ──────────────────────────────
+        ax4 = fig.add_subplot(gs[1, 1])
+        metrics = {
+            "ECE (%)": (self.ece_before, self.ece_after),
+            "MCE (%)": (self.mce_before, self.mce_after),
+            "Brier×10": (self.brier_before * 10, self.brier_after * 10),
+        }
+        x     = np.arange(len(metrics))
+        width = 0.35
+        labels, before_vals, after_vals = zip(*[
+            (k, v[0], v[1]) for k, v in metrics.items()
+        ])
+        ax4.bar(x - width / 2, before_vals, width, label="Before",
+                color="#E63946", alpha=0.85, edgecolor="#333", linewidth=0.5)
+        ax4.bar(x + width / 2, after_vals,  width, label="After",
+                color="#2DC653", alpha=0.85, edgecolor="#333", linewidth=0.5)
+
+        # Annotate bars
+        for bars, vals in [
+            (ax4.containers[0], before_vals),
+            (ax4.containers[1], after_vals),
+        ]:
+            for bar, v in zip(bars, vals):
+                ax4.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + max(before_vals) * 0.02,
+                    f"{v:.3f}", ha="center", fontsize=8,
+                )
+
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(labels)
+        ax4.set_ylabel("Metric value")
+        ax4.set_title("Calibration Metrics Before vs. After")
+        ax4.legend()
+
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight")
+            logger.info("Calibration figure saved to %s", save_path)
+        if show:
+            plt.show()
+        return fig
+
+    @staticmethod
+    def _draw_reliability_diagram(
+        ax: plt.Axes,
+        y_true: np.ndarray,
+        y_prob: np.ndarray,
+        n_bins: int,
+        title: str,
+        colour: str,
+    ) -> None:
+        """Draw a single reliability diagram panel."""
+        frac_pos, mean_pred, bin_counts = reliability_curve(y_true, y_prob, n_bins)
+
+        # Perfect calibration reference line
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.9, alpha=0.5,
+                label="Perfect calibration")
+
+        # Calibration curve
+        ax.plot(mean_pred, frac_pos, "o-", color=colour, linewidth=1.8,
+                markersize=5, label="Model")
+
+        # Shaded gap between curve and diagonal
+        for mp, fp in zip(mean_pred, frac_pos):
+            ax.plot([mp, mp], [mp, fp], color=colour, alpha=0.25, linewidth=2.5)
+
+        # Histogram of score counts at the bottom
+        ax_twin = ax.twinx()
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bin_mids  = (bin_edges[:-1] + bin_edges[1:]) / 2
+        # Align histogram with calibration curve points
+        n_pts = min(len(bin_mids), len(bin_counts))
+        ax_twin.bar(
+            bin_mids[:n_pts], bin_counts[:n_pts],
+            width=0.9 / n_bins, alpha=0.15, color=colour, label="Count",
+        )
+        ax_twin.set_ylabel("Sample count", fontsize=8, color="#888")
+        ax_twin.tick_params(axis="y", labelsize=7, colors="#888")
+
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("Mean predicted probability")
+        ax.set_ylabel("Fraction of positives (fraud rate)")
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        ax.legend(fontsize=8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Threshold optimisation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def find_cost_optimal_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    cost_fn: float = DEFAULT_COST_FN,
+    cost_fp: float = DEFAULT_COST_FP,
+    n_grid: int = 1000,
+) -> Tuple[float, float]:
+    """Find the empirically optimal threshold by grid-searching the cost curve.
+
+    The analytical tau* = c_FP / (c_FP + c_FN) (Lemma 1) assumes perfect
+    calibration.  This function also searches empirically over a fine grid
+    to find the threshold that minimises actual cost on the validation set,
+    which may differ slightly from the analytical value due to residual
+    miscalibration.
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (N,)
+    y_prob : np.ndarray, shape (N,)
+        Calibrated fraud probabilities.
+    cost_fn : float
+        Cost of a false negative (missed fraud).
+    cost_fp : float
+        Cost of a false positive (false alarm).
+    n_grid : int, default 1000
+        Number of threshold values to evaluate.
+
+    Returns
+    -------
+    tau_analytical : float
+        Lemma 1 analytical threshold = c_FP / (c_FP + c_FN).
+    tau_empirical : float
+        Grid-search threshold that minimised cost on y_true.
+    """
+    tau_analytical = cost_fp / (cost_fp + cost_fn)
+    thresholds     = np.linspace(0.001, 0.999, n_grid)
+    costs          = []
+
+    for tau in thresholds:
+        y_pred = (y_prob >= tau).astype(int)
+        fn = int(((y_true == 1) & (y_pred == 0)).sum())
+        fp = int(((y_true == 0) & (y_pred == 1)).sum())
+        costs.append(fn * cost_fn + fp * cost_fp)
+
+    tau_empirical = float(thresholds[np.argmin(costs)])
+    logger.info(
+        "Threshold search: analytical τ*=%.4f  empirical τ*=%.4f  "
+        "(gap=%.4f)  cost_ratio=%.0f:1",
+        tau_analytical, tau_empirical,
+        abs(tau_analytical - tau_empirical),
+        cost_fn / cost_fp,
+    )
+    return tau_analytical, tau_empirical
+
+
+def plot_cost_threshold_curve(
+    y_true: np.ndarray,
+    probs_before: np.ndarray,
+    probs_after: np.ndarray,
+    cost_fn: float = DEFAULT_COST_FN,
+    cost_fp: float = DEFAULT_COST_FP,
+    tau_star: Optional[float] = None,
+    dataset_name: str = "",
+    save_path: Optional[str | Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """Plot expected cost vs. decision threshold before and after calibration.
+
+    Shows the paper's key finding: calibration shifts and sharpens the
+    cost minimum, enabling a more precisely placed operating point.
+
+    "The hybrid sets its threshold to minimize the expected loss and ...
+    the threshold of the hybrid reduces the cost per 100,000 transactions
+    by a percentage in the double-digits."  (Calibration Analysis section)
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (N,)
+    probs_before : np.ndarray, shape (N,)
+        Raw uncalibrated probabilities.
+    probs_after : np.ndarray, shape (N,)
+        Calibrated probabilities.
+    cost_fn : float
+    cost_fp : float
+    tau_star : float, optional
+        If provided, draw a vertical line at this threshold.
+    dataset_name : str
+    save_path : str or Path, optional
+    show : bool, default True
+
+    Returns
+    -------
+    plt.Figure
+    """
+    thresholds = np.linspace(0.001, 0.5, 500)   # focus on low-threshold region
+
+    def cost_curve(probs: np.ndarray) -> np.ndarray:
+        result = []
+        for tau in thresholds:
+            y_pred = (probs >= tau).astype(int)
+            fn = int(((y_true == 1) & (y_pred == 0)).sum())
+            fp = int(((y_true == 0) & (y_pred == 1)).sum())
+            result.append((fn * cost_fn + fp * cost_fp) / len(y_true) * 100_000)
+        return np.array(result)
+
+    costs_before = cost_curve(probs_before)
+    costs_after  = cost_curve(probs_after)
+
+    best_before = float(costs_before.min())
+    best_after  = float(costs_after.min())
+    saving_pct  = (best_before - best_after) / best_before * 100
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(thresholds, costs_before, label=f"Before calibration (min={best_before:.1f})",
+            color="#E63946", linewidth=1.5, alpha=0.9)
+    ax.plot(thresholds, costs_after,  label=f"After calibration  (min={best_after:.1f})",
+            color="#2DC653", linewidth=2.2)
+
+    if tau_star is not None:
+        ax.axvline(tau_star, color="#1D3557", linestyle="--", linewidth=1.2,
+                   label=f"τ* = {tau_star:.4f}  (analytical)")
+
+    # Mark minima
+    ax.scatter(
+        thresholds[np.argmin(costs_before)], best_before,
+        color="#E63946", s=60, zorder=5,
+    )
+    ax.scatter(
+        thresholds[np.argmin(costs_after)], best_after,
+        color="#2DC653", s=60, zorder=5,
+    )
+
+    ax.set_xlabel("Decision threshold τ", fontsize=11)
+    ax.set_ylabel("Expected cost per 100,000 transactions", fontsize=11)
+    ax.set_title(
+        f"Cost-Sensitive Threshold Analysis — {dataset_name}\n"
+        f"Calibration saves {saving_pct:.1f}% in expected cost  "
+        f"(c_FN={cost_fn:.0f}, c_FP={cost_fp:.0f})",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=10)
+    ax.set_xlim(0, thresholds[-1])
+
+    plt.tight_layout()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight")
+        logger.info("Cost-threshold curve saved to %s", save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Cross-fold calibration summary (Table 2 reproduction)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def summarise_cross_fold_calibration(
+    reports: List[CalibrationReport],
+) -> pd.DataFrame:
+    """Aggregate calibration metrics across folds into a Table 2 summary.
+
+    Parameters
+    ----------
+    reports : List[CalibrationReport]
+        One report per cross-validation fold.
+
+    Returns
+    -------
+    pd.DataFrame
+        Mean ± std for each metric across folds, formatted to match
+        Table 2 in the paper.
+    """
+    rows = [r.to_dict() for r in reports]
+    df   = pd.DataFrame(rows)
+
+    numeric_cols = [
+        "ece_before_pct", "ece_after_pct", "ece_delta_pp",
+        "mce_before_pct", "mce_after_pct",
+        "brier_before", "brier_after", "brier_delta",
+        "overconf_before", "overconf_after",
+    ]
+
+    summary_rows = []
+    for col in numeric_cols:
+        vals = df[col].values
+        summary_rows.append({
+            "metric": col,
+            "mean"  : round(float(vals.mean()), 4),
+            "std"   : round(float(vals.std()),  4),
+            "min"   : round(float(vals.min()),  4),
+            "max"   : round(float(vals.max()),  4),
+        })
+
+    summary_df = pd.DataFrame(summary_rows).set_index("metric")
+    logger.info(
+        "Cross-fold calibration summary (%d folds):\n"
+        "  ECE   %s%.2f ± %.2f%%  (before)  →  %.2f ± %.2f%%  (after)\n"
+        "  Brier  %.4f ± %.4f  (before)  →  %.4f ± %.4f  (after)",
+        len(reports),
+        "",
+        summary_df.loc["ece_before_pct", "mean"],
+        summary_df.loc["ece_before_pct", "std"],
+        summary_df.loc["ece_after_pct",  "mean"],
+        summary_df.loc["ece_after_pct",  "std"],
+        summary_df.loc["brier_before",   "mean"],
+        summary_df.loc["brier_before",   "std"],
+        summary_df.loc["brier_after",    "mean"],
+        summary_df.loc["brier_after",    "std"],
+    )
+    return summary_df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Full pipeline helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def run_calibration_pipeline(
+    fold_data: List[dict],
+    dnn_models: List,
+    ensemble_heads: List,
+    calibrator_class: type = IsotonicCalibrator,
+    dataset_name: str = "Credit Card",
+    figures_dir: str | Path = "results/figures",
+    models_dir: str | Path = "results/models",
+    cost_fn: float = DEFAULT_COST_FN,
+    cost_fp: float = DEFAULT_COST_FP,
+    n_bins: int = DEFAULT_N_BINS,
+) -> Tuple[List[CalibrationReport], pd.DataFrame]:
+    """Run the full calibration analysis pipeline across all folds.
+
+    For each fold:
+    1. Extract DNN embeddings.
+    2. Get raw uncalibrated probabilities from the ensemble head.
+    3. Fit the chosen calibrator on the validation fold.
+    4. Get calibrated probabilities.
+    5. Build a CalibrationReport and produce all figures.
+
+    After all folds:
+    6. Aggregate into a cross-fold summary table (Table 2 format).
+
+    Parameters
+    ----------
+    fold_data : List[dict]
+        Output of preprocessing.run_pipeline().
+    dnn_models : List[FraudDNNEncoder]
+        Trained DNN encoders from model.train_all_folds().
+    ensemble_heads : List[EnsembleHead]
+        Fitted ensemble heads from ensemble.train_all_folds().
+    calibrator_class : type, default IsotonicCalibrator
+        The calibrator class to instantiate per fold.
+    dataset_name : str
+    figures_dir : str or Path
+    models_dir : str or Path
+    cost_fn : float
+    cost_fp : float
+    n_bins : int
+
+    Returns
+    -------
+    reports : List[CalibrationReport]
+    summary_df : pd.DataFrame
+        Cross-fold summary in Table 2 format.
+    """
+    figures_dir = Path(figures_dir)
+    models_dir  = Path(models_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    tau_star = cost_fp / (cost_fp + cost_fn)
+    reports: List[CalibrationReport] = []
+
+    for fold_idx, (fold, dnn, head) in enumerate(
+        zip(fold_data, dnn_models, ensemble_heads)
+    ):
+        logger.info("═══ Calibration Fold %d/%d ═══", fold_idx + 1, len(fold_data))
+
+        Z_val  = dnn.extract_embeddings(fold["X_val"])
+        y_val  = fold["y_val"]
+
+        # Raw scores from ensemble (already available via head)
+        raw_probs = head.predict_proba_uncalibrated(Z_val)
+
+        # Fit calibrator on this fold's validation scores
+        Z_train    = dnn.extract_embeddings(fold["X_train"])
+        raw_train  = head.predict_proba_uncalibrated(Z_train)
+        cal        = calibrator_class()
+        cal.fit(raw_train, fold["y_train"])
+
+        cal_probs = cal.transform(raw_probs)
+
+        # Build report
+        report = CalibrationReport.build(
+            y_true          = y_val,
+            probs_before    = raw_probs,
+            probs_after     = cal_probs,
+            dataset_name    = dataset_name,
+            calibrator_name = cal.name,
+            n_bins          = n_bins,
+        )
+        reports.append(report)
+        logger.info("%s", report.summary())
+
+        # Reliability diagrams + score histograms + metric bars
+        report.plot(
+            save_path=figures_dir / f"calibration_{dataset_name.replace(' ','_').lower()}_fold{fold_idx}.png",
+            show=False,
+        )
+
+        # Cost-threshold curve
+        plot_cost_threshold_curve(
+            y_val, raw_probs, cal_probs,
+            cost_fn=cost_fn, cost_fp=cost_fp,
+            tau_star=tau_star,
+            dataset_name=f"{dataset_name} (fold {fold_idx + 1})",
+            save_path=figures_dir / f"cost_threshold_{dataset_name.replace(' ','_').lower()}_fold{fold_idx}.png",
+            show=False,
+        )
+
+        # Save calibrator
+        cal.save(models_dir / f"calibrator_{cal.name}_fold{fold_idx}.pkl")
+
+        # Log threshold comparison
+        tau_a, tau_e = find_cost_optimal_threshold(y_val, cal_probs, cost_fn, cost_fp)
+        logger.info(
+            "  τ* analytical=%.4f  τ* empirical=%.4f  gap=%.4f",
+            tau_a, tau_e, abs(tau_a - tau_e),
+        )
+
+    summary_df = summarise_cross_fold_calibration(reports)
+    summary_df.to_csv(figures_dir / f"calibration_summary_{dataset_name.replace(' ','_').lower()}.csv")
+    logger.info("Calibration pipeline complete.  Summary saved.")
+
+    return reports, summary_df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Run the calibration pipeline for the hybrid fraud detection model."
+    )
+    parser.add_argument(
+        "--processed-dir", type=str, default="data/processed",
+        help="Directory containing fold_data.pkl.",
+    )
+    parser.add_argument(
+        "--models-dir", type=str, default="results/models",
+        help="Directory containing dnn_fold*.pt and ensemble_*_fold*.pkl.",
+    )
+    parser.add_argument(
+        "--figures-dir", type=str, default="results/figures",
+        help="Output directory for calibration figures.",
+    )
+    parser.add_argument(
+        "--backend", type=str, default="xgboost",
+        choices=["xgboost", "lightgbm"],
+    )
+    parser.add_argument(
+        "--dataset", type=str, default="Credit Card",
+        help="Human-readable dataset name for figure titles.",
+    )
+    parser.add_argument(
+        "--calibrator", type=str, default="isotonic",
+        choices=["isotonic", "platt", "temperature"],
+        help="Calibration method (default: isotonic).",
+    )
+    parser.add_argument(
+        "--cost-fn", type=float, default=DEFAULT_COST_FN,
+        help=f"Cost of a missed fraud (default: {DEFAULT_COST_FN}).",
+    )
+    parser.add_argument(
+        "--cost-fp", type=float, default=DEFAULT_COST_FP,
+        help=f"Cost of a false alarm (default: {DEFAULT_COST_FP}).",
+    )
+    args = parser.parse_args()
+
+    calibrator_map = {
+        "isotonic"   : IsotonicCalibrator,
+        "platt"      : PlattCalibrator,
+        "temperature": TemperatureCalibrator,
+    }
+
+    # Late imports to avoid circular dependencies
+    from src.ensemble import EnsembleHead
+    from src.model    import FraudDNNEncoder
+
+    processed_dir = Path(args.processed_dir)
+    models_dir    = Path(args.models_dir)
+
+    fold_data = joblib.load(processed_dir / "fold_data.pkl")
+    n_folds   = len(fold_data)
+
+    dnn_models = [
+        FraudDNNEncoder.load(models_dir / f"dnn_fold{k}.pt")
+        for k in range(n_folds)
+    ]
+    ensemble_heads = [
+        EnsembleHead.load(models_dir / f"ensemble_{args.backend}_fold{k}.pkl")
+        for k in range(n_folds)
+    ]
+
+    print(
+        f"Loaded {n_folds} folds  |  "
+        f"backend={args.backend}  |  "
+        f"calibrator={args.calibrator}  |  "
+        f"τ*={args.cost_fp / (args.cost_fp + args.cost_fn):.4f}"
+    )
+
+    reports, summary_df = run_calibration_pipeline(
+        fold_data        = fold_data,
+        dnn_models       = dnn_models,
+        ensemble_heads   = ensemble_heads,
+        calibrator_class = calibrator_map[args.calibrator],
+        dataset_name     = args.dataset,
+        figures_dir      = args.figures_dir,
+        models_dir       = args.models_dir,
+        cost_fn          = args.cost_fn,
+        cost_fp          = args.cost_fp,
+    )
+
+    print(f"\nCross-fold summary ({args.dataset}):")
+    print(summary_df[["mean", "std"]].to_string())
+    print(f"\nAll figures saved to {args.figures_dir}/")
