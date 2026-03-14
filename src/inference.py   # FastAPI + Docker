@@ -1,0 +1,964 @@
+"""
+inference.py
+============
+FastAPI real-time inference server for the hybrid fraud detection framework.
+
+Paper
+-----
+"A Hybrid Deep Learning and Explainable AI Framework for Real-Time
+Financial Fraud Detection in Dynamic Environments"
+
+Deployment architecture (from paper Methodology section)
+---------------------------------------------------------
+"We package the inference pipeline including embedding extraction,
+ensemble classification and SHAP explanation in Docker and make it
+accessible through REST APIs generated using FastAPI.  Latency
+monitoring is also involved so that predictions can satisfy
+sub-millisecond limits."
+
+"The classifier is strictly synchronous and explanations are
+asynchronous on the serving path, so that p50 and p99 latency is
+single-digit milliseconds and the SHAP artifact can reach analyst
+consoles a few hundred milliseconds later without impacting the
+customer experience."
+
+"A lightweight governance layer stores the entire context of the
+decision in terms of features, score, threshold, explanation, version
+pins, and provenance of data."
+
+Two-path serving design
+-----------------------
+  SYNCHRONOUS  (< 5 ms target):
+    POST /predict
+      raw features → preprocess → DNN encode → ensemble score
+      → calibrate → threshold → fraud decision + reason codes
+
+  ASYNCHRONOUS (< 500 ms, background task):
+    The same request triggers a background task that runs TreeSHAP
+    and appends the full attribution vector to an in-memory audit log
+    accessible at GET /explain/{request_id}
+
+Endpoints
+---------
+  POST /predict               — score a single transaction
+  POST /predict/batch         — score a batch (up to 512 transactions)
+  GET  /explain/{request_id}  — retrieve async SHAP explanation
+  GET  /health                — liveness probe (used by Docker/K8s)
+  GET  /metrics               — latency stats and throughput counters
+  GET  /model/info            — model version, threshold, feature list
+
+Usage
+-----
+  # Start server (development)
+  uvicorn src.inference:app --host 0.0.0.0 --port 8000 --workers 1
+
+  # Score a transaction
+  curl -X POST http://localhost:8000/predict \\
+    -H "Content-Type: application/json" \\
+    -d '{"transaction_id": "TX_001", "V1": -1.36, "V2": -0.07,
+         "Amount": 149.62, "log_amount": 5.01, "time_delta": 3.0,
+         "amount_zscore_rolling": 0.4, "tx_velocity_100": 12,
+         "tx_velocity_500": 48, "hour_of_day": 14, "is_night": 0,
+         "amount_rolling_mean_100": 88.3, "amount_rolling_std_100": 44.1,
+         "V3": 2.53, ...}'
+
+  # Retrieve SHAP explanation (async, available within ~500 ms)
+  curl http://localhost:8000/explain/TX_001
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+import uuid
+from collections import deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import joblib
+import numpy as np
+import torch
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+# ── Internal imports ──────────────────────────────────────────────────────────
+# Adjust sys.path if running directly rather than as a package
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.model           import FraudDNNEncoder                   # noqa: E402
+from src.ensemble        import EnsembleHead                       # noqa: E402
+from src.calibration     import IsotonicCalibrator                 # noqa: E402
+from src.shap_explainer  import FraudSHAPExplainer                 # noqa: E402
+from src.preprocessing   import ALL_FEATURE_COLS, preprocess_single_transaction  # noqa: E402
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("inference")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuration — read from environment variables with safe defaults
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: Path to the trained DNN encoder checkpoint (.pt file).
+MODEL_DNN_PATH: str = os.getenv("MODEL_DNN_PATH", "results/models/dnn_fold0.pt")
+
+#: Path to the fitted ensemble head checkpoint (.pkl file).
+MODEL_ENSEMBLE_PATH: str = os.getenv(
+    "MODEL_ENSEMBLE_PATH", "results/models/ensemble_xgboost_fold0.pkl"
+)
+
+#: Path to the fitted isotonic calibrator (.pkl file).
+MODEL_CALIBRATOR_PATH: str = os.getenv(
+    "MODEL_CALIBRATOR_PATH", "results/models/calibrator_isotonic_fold0.pkl"
+)
+
+#: Path to the fitted SHAP explainer (.pkl file).
+MODEL_SHAP_PATH: str = os.getenv(
+    "MODEL_SHAP_PATH", "results/models/shap_explainer_fold0.pkl"
+)
+
+#: Path to the fitted StandardScaler (.pkl file).
+SCALER_PATH: str = os.getenv("SCALER_PATH", "data/processed/scaler_fold0.pkl")
+
+#: Cost-optimal threshold τ* (paper Lemma 1: c_FP / (c_FP + c_FN)).
+TAU_STAR: float = float(os.getenv("TAU_STAR", "0.0099"))
+
+#: Model version string embedded in every response for audit traceability.
+MODEL_VERSION: str = os.getenv("MODEL_VERSION", "v1.0")
+
+#: Embedding dimension of the DNN encoder.
+EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "32"))
+
+#: Maximum batch size accepted by POST /predict/batch.
+MAX_BATCH_SIZE: int = int(os.getenv("MAX_BATCH_SIZE", "512"))
+
+#: Number of recent latency samples kept for the /metrics endpoint.
+LATENCY_WINDOW: int = int(os.getenv("LATENCY_WINDOW", "1000"))
+
+#: Maximum number of SHAP explanation artifacts kept in memory.
+EXPLANATION_CACHE_SIZE: int = int(os.getenv("EXPLANATION_CACHE_SIZE", "10000"))
+
+DEVICE = torch.device("cpu")   # paper: "single-digit milliseconds on commodity CPUs"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Global model registry — populated at startup, shared across requests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _ModelRegistry:
+    """Singleton container for all loaded model artefacts.
+
+    Loaded once at application startup in the lifespan handler and reused
+    for every request.  All fields are Optional so startup errors surface
+    clearly rather than silently failing at request time.
+    """
+    dnn_encoder   : Optional[FraudDNNEncoder]      = None
+    ensemble_head : Optional[EnsembleHead]          = None
+    calibrator    : Optional[IsotonicCalibrator]    = None
+    shap_explainer: Optional[FraudSHAPExplainer]    = None
+    scaler        : Optional[Any]                   = None
+    feature_cols  : List[str]                       = ALL_FEATURE_COLS
+    embedding_dim : int                             = EMBEDDING_DIM
+    tau_star      : float                           = TAU_STAR
+    model_version : str                             = MODEL_VERSION
+
+
+_registry = _ModelRegistry()
+
+# ── In-memory stores ──────────────────────────────────────────────────────────
+
+# Latency samples (rolling window) — used by GET /metrics
+_predict_latencies_ms: deque = deque(maxlen=LATENCY_WINDOW)
+_explain_latencies_ms: deque = deque(maxlen=LATENCY_WINDOW)
+
+# Request counters
+_counters: Dict[str, int] = {
+    "total_requests"  : 0,
+    "fraud_flags"     : 0,
+    "legit_decisions" : 0,
+    "errors"          : 0,
+}
+
+# Async SHAP explanation cache: request_id -> explanation dict
+# Bounded deque prevents unbounded memory growth in long-running containers.
+_explanation_cache: Dict[str, Dict] = {}
+_explanation_order: deque           = deque(maxlen=EXPLANATION_CACHE_SIZE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Startup / shutdown lifespan
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load all model artefacts once at server startup.
+
+    FastAPI lifespan events ensure models are loaded before the first
+    request is served and resources are released cleanly on shutdown.
+    """
+    logger.info("Loading model artefacts …")
+    t0 = time.perf_counter()
+
+    try:
+        # DNN encoder
+        _registry.dnn_encoder = FraudDNNEncoder.load(MODEL_DNN_PATH, device=DEVICE)
+        _registry.dnn_encoder.eval()
+        logger.info("  DNN encoder loaded from %s", MODEL_DNN_PATH)
+
+        # Ensemble head (includes its own calibrator fitted during training)
+        _registry.ensemble_head = EnsembleHead.load(MODEL_ENSEMBLE_PATH)
+        logger.info("  Ensemble head loaded from %s", MODEL_ENSEMBLE_PATH)
+
+        # Standalone isotonic calibrator (may override the one inside EnsembleHead)
+        if Path(MODEL_CALIBRATOR_PATH).exists():
+            _registry.calibrator = IsotonicCalibrator.load(MODEL_CALIBRATOR_PATH)
+            logger.info("  Calibrator loaded from %s", MODEL_CALIBRATOR_PATH)
+
+        # SHAP explainer (optional — if not present, /explain returns 503)
+        if Path(MODEL_SHAP_PATH).exists():
+            _registry.shap_explainer = FraudSHAPExplainer.load(
+                MODEL_SHAP_PATH, _registry.ensemble_head
+            )
+            logger.info("  SHAP explainer loaded from %s", MODEL_SHAP_PATH)
+        else:
+            logger.warning(
+                "SHAP explainer not found at %s. /explain endpoints will return 503.",
+                MODEL_SHAP_PATH,
+            )
+
+        # Feature scaler
+        _registry.scaler = joblib.load(SCALER_PATH)
+        logger.info("  Scaler loaded from %s", SCALER_PATH)
+
+        # Feature column list (may be overridden by saved pkl)
+        feature_cols_path = Path("data/processed/feature_cols.pkl")
+        if feature_cols_path.exists():
+            _registry.feature_cols = joblib.load(feature_cols_path)
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "All artefacts loaded in %.1f ms.  "
+            "Features=%d  EmbeddingDim=%d  τ*=%.4f  Version=%s",
+            elapsed,
+            len(_registry.feature_cols),
+            _registry.embedding_dim,
+            _registry.tau_star,
+            _registry.model_version,
+        )
+
+    except Exception as exc:
+        logger.error("Failed to load model artefacts: %s", exc, exc_info=True)
+        raise
+
+    yield  # Server runs here
+
+    logger.info("Shutting down inference server.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FastAPI application
+# ═══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(
+    title       = "Hybrid Fraud Detection API",
+    description = (
+        "Real-time financial fraud detection using a hybrid DNN + XGBoost "
+        "architecture with SHAP-based explainability.\n\n"
+        "Paper: *A Hybrid Deep Learning and Explainable AI Framework for "
+        "Real-Time Financial Fraud Detection in Dynamic Environments*"
+    ),
+    version     = MODEL_VERSION,
+    lifespan    = lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins  = ["*"],
+    allow_methods  = ["GET", "POST"],
+    allow_headers  = ["*"],
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pydantic schemas
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TransactionFeatures(BaseModel):
+    """Input schema for a single transaction.
+
+    All PCA-anonymised features V1–V28 are required along with the
+    original Amount field and all engineered features produced by
+    preprocessing.py.  The transaction_id is caller-supplied and
+    propagated through the audit log.
+
+    Paper: "raw transaction attributes, device and channel identifiers,
+    merchant metadata, and account history pointers."
+    """
+
+    transaction_id           : str   = Field(default_factory=lambda: str(uuid.uuid4()),
+                                             description="Unique transaction identifier.")
+    # PCA features (anonymised, float)
+    V1  : float; V2  : float; V3  : float; V4  : float; V5  : float
+    V6  : float; V7  : float; V8  : float; V9  : float; V10 : float
+    V11 : float; V12 : float; V13 : float; V14 : float; V15 : float
+    V16 : float; V17 : float; V18 : float; V19 : float; V20 : float
+    V21 : float; V22 : float; V23 : float; V24 : float; V25 : float
+    V26 : float; V27 : float; V28 : float
+    # Raw numeric
+    Amount                   : float = Field(..., ge=0.0,  description="Transaction amount (USD).")
+    # Engineered features (computed upstream by feature store / preprocessing.py)
+    log_amount               : float = Field(..., description="log(1 + Amount)")
+    amount_zscore_rolling    : float = Field(..., description="Amount z-score (expanding window).")
+    time_delta               : float = Field(..., ge=0.0,  description="Seconds since previous transaction.")
+    tx_velocity_100          : float = Field(..., ge=0.0,  description="Transactions in last 100-row window.")
+    tx_velocity_500          : float = Field(..., ge=0.0,  description="Transactions in last 500-row window.")
+    hour_of_day              : int   = Field(..., ge=0, le=23, description="Hour of day (0–23).")
+    is_night                 : int   = Field(..., ge=0, le=1,  description="1 if hour in [0,5].")
+    amount_rolling_mean_100  : float = Field(..., description="Rolling mean of Amount (100-row window).")
+    amount_rolling_std_100   : float = Field(..., ge=0.0,  description="Rolling std of Amount (100-row window).")
+
+    model_config = {"extra": "allow"}   # accept extra fields gracefully
+
+    @field_validator("Amount")
+    @classmethod
+    def amount_must_be_finite(cls, v: float) -> float:
+        if not np.isfinite(v):
+            raise ValueError("Amount must be a finite number.")
+        return v
+
+
+class BatchTransactionRequest(BaseModel):
+    """Input schema for batch scoring."""
+    transactions: List[TransactionFeatures] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_BATCH_SIZE,
+        description=f"List of transactions to score (max {MAX_BATCH_SIZE}).",
+    )
+
+
+class FraudPrediction(BaseModel):
+    """Response schema for a single fraud prediction.
+
+    Matches the governance-layer artifact described in the paper:
+    "features, score, threshold, explanation, version pins, and
+    provenance of data."
+    """
+    transaction_id   : str
+    fraud_score      : float = Field(..., description="Calibrated fraud probability P̂(y=1|z).")
+    decision         : int   = Field(..., description="0=legitimate, 1=fraud.")
+    decision_label   : str   = Field(..., description="'FRAUD' or 'LEGITIMATE'.")
+    threshold        : float = Field(..., description="Cost-optimal threshold τ* used.")
+    model_version    : str
+    latency_ms       : float = Field(..., description="End-to-end synchronous inference latency (ms).")
+    request_id       : str   = Field(..., description="Unique request ID for async SHAP retrieval.")
+    reason_codes     : List[str] = Field(
+        default_factory=list,
+        description="Top driving features (available immediately; full SHAP async).",
+    )
+
+
+class BatchFraudPrediction(BaseModel):
+    """Response schema for batch scoring."""
+    predictions      : List[FraudPrediction]
+    n_fraud_flagged  : int
+    batch_latency_ms : float
+
+
+class ExplanationResponse(BaseModel):
+    """Response schema for GET /explain/{request_id}."""
+    request_id       : str
+    transaction_id   : str
+    fraud_score      : float
+    decision         : int
+    base_value       : float
+    shap_total       : float
+    shap_boundary    : float
+    shap_margin      : float
+    shap_values      : Dict[str, float]
+    top_positive_drivers: List[Dict[str, Any]]
+    top_negative_drivers: List[Dict[str, Any]]
+    reason_codes     : List[str]
+    latency_ms       : float
+    model_version    : str
+
+
+class HealthResponse(BaseModel):
+    status           : str
+    model_loaded     : bool
+    shap_loaded      : bool
+    model_version    : str
+    uptime_s         : float
+
+
+class MetricsResponse(BaseModel):
+    total_requests   : int
+    fraud_flags      : int
+    legit_decisions  : int
+    errors           : int
+    fraud_rate_pct   : float
+    p50_latency_ms   : float
+    p95_latency_ms   : float
+    p99_latency_ms   : float
+    explain_p50_ms   : float
+    explain_p99_ms   : float
+    pending_explains : int
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Core inference logic (shared by single and batch endpoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SERVER_START = time.time()
+
+
+def _transaction_to_vector(tx: TransactionFeatures) -> np.ndarray:
+    """Convert a TransactionFeatures Pydantic model to a raw feature vector.
+
+    Extracts features in the exact order defined by _registry.feature_cols
+    so the scaler and DNN receive the correct input dimensionality.
+
+    Parameters
+    ----------
+    tx : TransactionFeatures
+
+    Returns
+    -------
+    np.ndarray, shape (1, n_features), dtype float32
+        Unscaled feature vector.
+    """
+    tx_dict = tx.model_dump()
+    missing = [c for c in _registry.feature_cols if c not in tx_dict]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Missing required feature(s): {missing}",
+        )
+    vec = np.array(
+        [float(tx_dict[c]) for c in _registry.feature_cols],
+        dtype=np.float32,
+    ).reshape(1, -1)
+    return vec
+
+
+def _score_vectors(
+    raw_vectors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run the full synchronous scoring pipeline on a batch of raw vectors.
+
+    Pipeline:
+        raw features → StandardScaler → DNN encode → XGBoost score
+        → isotonic calibrate → threshold
+
+    Paper: "p50 and p99 latency is single-digit milliseconds"
+
+    Parameters
+    ----------
+    raw_vectors : np.ndarray, shape (N, n_features)
+        Unscaled feature vectors.
+
+    Returns
+    -------
+    fraud_scores : np.ndarray, shape (N,)
+        Calibrated fraud probabilities.
+    decisions : np.ndarray, shape (N,), int
+        Binary decisions (0 or 1) at τ*.
+    embeddings : np.ndarray, shape (N, embedding_dim)
+        DNN latent embeddings z (used by async SHAP background task).
+    """
+    # Step 1 — normalise
+    scaled = _registry.scaler.transform(raw_vectors).astype(np.float32)
+
+    # Step 2 — DNN encode (no gradient needed at inference)
+    with torch.no_grad():
+        z_tensor = torch.from_numpy(scaled).to(DEVICE)
+        embeddings = _registry.dnn_encoder.encode(z_tensor).cpu().numpy()
+
+    # Step 3 — ensemble score + calibrate
+    fraud_scores = _registry.ensemble_head.predict_proba(embeddings)
+
+    # Step 4 — threshold decision
+    decisions = (fraud_scores >= _registry.tau_star).astype(int)
+
+    return fraud_scores, decisions, embeddings
+
+
+def _quick_reason_codes(
+    embeddings: np.ndarray,
+    top_n: int = 3,
+) -> List[str]:
+    """Generate lightweight reason codes without full TreeSHAP.
+
+    Uses the ensemble head's feature importances (not SHAP) to produce
+    instant reason codes on the synchronous path.  Full SHAP explanations
+    are computed asynchronously and retrieved via GET /explain/{id}.
+
+    Parameters
+    ----------
+    embeddings : np.ndarray, shape (1, embedding_dim)
+    top_n : int, default 3
+
+    Returns
+    -------
+    List[str]
+        Plain-English reason strings for the analyst dashboard.
+    """
+    try:
+        clf        = _registry.ensemble_head.clf_
+        importances = np.array(clf.feature_importances_)
+        top_idx     = np.argsort(importances)[-top_n:][::-1]
+        feat_names  = [f"z_{i:02d}" for i in range(len(importances))]
+        codes = [
+            f"{feat_names[i]} (importance={importances[i]:.3f})"
+            for i in top_idx
+        ]
+        return codes
+    except Exception:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Async SHAP background task
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _run_shap_async(
+    request_id: str,
+    transaction_id: str,
+    embeddings: np.ndarray,
+    fraud_score: float,
+    decision: int,
+) -> None:
+    """Compute full TreeSHAP explanation in a background task.
+
+    Runs in the FastAPI BackgroundTasks pool so the synchronous /predict
+    response is returned immediately while SHAP computes asynchronously.
+
+    Paper: "The classifier is strictly synchronous and explanations are
+    asynchronous on the serving path, so that p50 and p99 latency is
+    single-digit milliseconds and the SHAP artifact can reach analyst
+    consoles a few hundred milliseconds later."
+
+    Result is stored in _explanation_cache keyed by request_id.
+
+    Parameters
+    ----------
+    request_id     : str
+    transaction_id : str
+    embeddings     : np.ndarray, shape (1, embedding_dim)
+    fraud_score    : float
+    decision       : int
+    """
+    if _registry.shap_explainer is None:
+        return
+
+    t0 = time.perf_counter()
+    try:
+        artifact = _registry.shap_explainer.explanation_artifact(
+            z              = embeddings[0],
+            fraud_score    = fraud_score,
+            decision       = decision,
+            transaction_id = transaction_id,
+            tau_star       = _registry.tau_star,
+            model_version  = _registry.model_version,
+        )
+        artifact["request_id"] = request_id
+        artifact["latency_ms"] = round((time.perf_counter() - t0) * 1000, 3)
+        artifact["model_version"] = _registry.model_version
+
+        # Evict oldest entry if cache is full
+        if len(_explanation_cache) >= EXPLANATION_CACHE_SIZE:
+            oldest = _explanation_order.popleft()
+            _explanation_cache.pop(oldest, None)
+
+        _explanation_cache[request_id] = artifact
+        _explanation_order.append(request_id)
+
+        _explain_latencies_ms.append(artifact["latency_ms"])
+        logger.debug(
+            "SHAP complete: request_id=%s  latency=%.1f ms",
+            request_id, artifact["latency_ms"],
+        )
+    except Exception as exc:
+        logger.error("SHAP background task failed for %s: %s", request_id, exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# API endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post(
+    "/predict",
+    response_model=FraudPrediction,
+    summary="Score a single transaction",
+    description=(
+        "Synchronous fraud scoring endpoint.  Returns the fraud probability, "
+        "binary decision at τ*, and top-3 reason codes in single-digit "
+        "milliseconds.  Full SHAP explanation is computed asynchronously and "
+        "retrievable via GET /explain/{request_id}."
+    ),
+)
+async def predict(
+    tx: TransactionFeatures,
+    background_tasks: BackgroundTasks,
+) -> FraudPrediction:
+    """Score a single transaction synchronously.
+
+    Implements the paper's two-path serving design:
+    - Synchronous path: preprocess → DNN → ensemble → calibrate → decide
+    - Async path (background): TreeSHAP → store in explanation cache
+    """
+    t0         = time.perf_counter()
+    request_id = str(uuid.uuid4())
+
+    try:
+        # ── Synchronous scoring ───────────────────────────────────────────────
+        raw_vec = _transaction_to_vector(tx)
+        fraud_scores, decisions, embeddings = _score_vectors(raw_vec)
+
+        fraud_score = float(fraud_scores[0])
+        decision    = int(decisions[0])
+        latency_ms  = (time.perf_counter() - t0) * 1000
+
+        _predict_latencies_ms.append(latency_ms)
+        _counters["total_requests"] += 1
+        if decision == 1:
+            _counters["fraud_flags"] += 1
+        else:
+            _counters["legit_decisions"] += 1
+
+        # Quick reason codes (from feature importances, not SHAP)
+        reason_codes = _quick_reason_codes(embeddings)
+
+        logger.info(
+            "PREDICT  tx=%-20s  score=%.4f  decision=%s  latency=%.2f ms",
+            tx.transaction_id,
+            fraud_score,
+            "FRAUD" if decision else "LEGIT",
+            latency_ms,
+        )
+
+        # ── Async SHAP background task ────────────────────────────────────────
+        background_tasks.add_task(
+            _run_shap_async,
+            request_id     = request_id,
+            transaction_id = tx.transaction_id,
+            embeddings     = embeddings,
+            fraud_score    = fraud_score,
+            decision       = decision,
+        )
+
+        return FraudPrediction(
+            transaction_id = tx.transaction_id,
+            fraud_score    = round(fraud_score, 6),
+            decision       = decision,
+            decision_label = "FRAUD" if decision else "LEGITIMATE",
+            threshold      = _registry.tau_star,
+            model_version  = _registry.model_version,
+            latency_ms     = round(latency_ms, 3),
+            request_id     = request_id,
+            reason_codes   = reason_codes,
+        )
+
+    except HTTPException:
+        _counters["errors"] += 1
+        raise
+    except Exception as exc:
+        _counters["errors"] += 1
+        logger.error("Prediction error for tx=%s: %s", tx.transaction_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Scoring pipeline failed: {exc}",
+        )
+
+
+@app.post(
+    "/predict/batch",
+    response_model=BatchFraudPrediction,
+    summary="Score a batch of transactions",
+    description=(
+        f"Score up to {MAX_BATCH_SIZE} transactions in one call.  "
+        "Batching amortises DNN and ensemble overhead — preferred for "
+        "bulk replay or back-testing scenarios."
+    ),
+)
+async def predict_batch(
+    batch: BatchTransactionRequest,
+    background_tasks: BackgroundTasks,
+) -> BatchFraudPrediction:
+    """Score a batch of transactions.
+
+    Stacks all feature vectors into a single numpy matrix and runs the
+    DNN and ensemble in one vectorised forward pass.
+    """
+    t0 = time.perf_counter()
+
+    try:
+        # Stack raw vectors
+        raw_vectors = np.vstack([
+            _transaction_to_vector(tx) for tx in batch.transactions
+        ])
+
+        fraud_scores, decisions, embeddings = _score_vectors(raw_vectors)
+        batch_latency_ms = (time.perf_counter() - t0) * 1000
+
+        predictions = []
+        for i, tx in enumerate(batch.transactions):
+            request_id   = str(uuid.uuid4())
+            fraud_score  = float(fraud_scores[i])
+            decision     = int(decisions[i])
+            reason_codes = _quick_reason_codes(embeddings[i : i + 1])
+
+            _predict_latencies_ms.append(batch_latency_ms / len(batch.transactions))
+            _counters["total_requests"] += 1
+            if decision == 1:
+                _counters["fraud_flags"] += 1
+            else:
+                _counters["legit_decisions"] += 1
+
+            background_tasks.add_task(
+                _run_shap_async,
+                request_id     = request_id,
+                transaction_id = tx.transaction_id,
+                embeddings     = embeddings[i : i + 1],
+                fraud_score    = fraud_score,
+                decision       = decision,
+            )
+
+            predictions.append(FraudPrediction(
+                transaction_id = tx.transaction_id,
+                fraud_score    = round(fraud_score, 6),
+                decision       = decision,
+                decision_label = "FRAUD" if decision else "LEGITIMATE",
+                threshold      = _registry.tau_star,
+                model_version  = _registry.model_version,
+                latency_ms     = round(batch_latency_ms / len(batch.transactions), 3),
+                request_id     = request_id,
+                reason_codes   = reason_codes,
+            ))
+
+        n_fraud = sum(p.decision for p in predictions)
+        logger.info(
+            "BATCH  n=%d  fraud=%d  batch_latency=%.2f ms  per_tx=%.2f ms",
+            len(predictions), n_fraud, batch_latency_ms,
+            batch_latency_ms / len(predictions),
+        )
+
+        return BatchFraudPrediction(
+            predictions      = predictions,
+            n_fraud_flagged  = n_fraud,
+            batch_latency_ms = round(batch_latency_ms, 3),
+        )
+
+    except HTTPException:
+        _counters["errors"] += 1
+        raise
+    except Exception as exc:
+        _counters["errors"] += 1
+        logger.error("Batch prediction error: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Batch scoring failed: {exc}",
+        )
+
+
+@app.get(
+    "/explain/{request_id}",
+    response_model=ExplanationResponse,
+    summary="Retrieve async SHAP explanation",
+    description=(
+        "Retrieve the full TreeSHAP explanation for a previously scored "
+        "transaction.  SHAP runs asynchronously after /predict returns; "
+        "poll this endpoint until the explanation is available (typically "
+        "within 500 ms)."
+    ),
+)
+async def get_explanation(request_id: str) -> ExplanationResponse:
+    """Return the stored SHAP explanation for a request_id.
+
+    Paper: "each fraud alert is accompanied by an SHAP explanation,
+    and interpretability is further supported through live operations."
+
+    Returns 404 if the explanation has not been computed yet (poll again),
+    503 if the SHAP explainer was not loaded at startup.
+    """
+    if _registry.shap_explainer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SHAP explainer not loaded.  Check MODEL_SHAP_PATH.",
+        )
+
+    artifact = _explanation_cache.get(request_id)
+    if artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Explanation for request_id='{request_id}' not yet available "
+                "or has expired.  Retry in 200–500 ms."
+            ),
+        )
+
+    return ExplanationResponse(
+        request_id           = request_id,
+        transaction_id       = artifact.get("transaction_id", ""),
+        fraud_score          = artifact.get("fraud_score", 0.0),
+        decision             = artifact.get("decision", 0),
+        base_value           = artifact.get("shap_base_value", 0.0),
+        shap_total           = artifact.get("shap_total", 0.0),
+        shap_boundary        = artifact.get("shap_boundary", 0.0),
+        shap_margin          = artifact.get("shap_margin", 0.0),
+        shap_values          = {
+            d["feature"]: d["shap"]
+            for d in artifact.get("top_drivers", [])
+        },
+        top_positive_drivers = [
+            d for d in artifact.get("top_drivers", []) if d.get("shap", 0) > 0
+        ],
+        top_negative_drivers = [
+            d for d in artifact.get("top_drivers", []) if d.get("shap", 0) < 0
+        ],
+        reason_codes         = artifact.get("reason_codes", []),
+        latency_ms           = artifact.get("latency_ms", 0.0),
+        model_version        = artifact.get("model_version", _registry.model_version),
+    )
+
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Liveness probe",
+    description="Kubernetes/Docker liveness and readiness probe endpoint.",
+)
+async def health() -> HealthResponse:
+    """Return server health status.
+
+    Used by Docker HEALTHCHECK and Kubernetes liveness probes.
+    Returns HTTP 200 when the model is loaded and ready to serve.
+    Returns HTTP 503 when artefacts have not been loaded.
+    """
+    model_loaded = (
+        _registry.dnn_encoder   is not None
+        and _registry.ensemble_head is not None
+        and _registry.scaler        is not None
+    )
+    shap_loaded = _registry.shap_explainer is not None
+    uptime      = round(time.time() - _SERVER_START, 1)
+
+    if not model_loaded:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model artefacts not loaded.",
+        )
+
+    return HealthResponse(
+        status        = "ok",
+        model_loaded  = model_loaded,
+        shap_loaded   = shap_loaded,
+        model_version = _registry.model_version,
+        uptime_s      = uptime,
+    )
+
+
+@app.get(
+    "/metrics",
+    response_model=MetricsResponse,
+    summary="Inference metrics",
+    description=(
+        "Latency percentiles and request counters.  "
+        "Paper: 'p50 and p99 latency is single-digit milliseconds'."
+    ),
+)
+async def metrics() -> MetricsResponse:
+    """Return rolling latency statistics and request counters.
+
+    The paper reports p50 and p99 predict latency on commodity CPUs.
+    This endpoint makes those numbers observable for each deployed instance.
+    """
+    def percentile(data: deque, p: float) -> float:
+        arr = np.array(data)
+        return float(np.percentile(arr, p)) if len(arr) > 0 else 0.0
+
+    total   = _counters["total_requests"]
+    flagged = _counters["fraud_flags"]
+
+    return MetricsResponse(
+        total_requests   = total,
+        fraud_flags      = flagged,
+        legit_decisions  = _counters["legit_decisions"],
+        errors           = _counters["errors"],
+        fraud_rate_pct   = round(flagged / max(total, 1) * 100, 4),
+        p50_latency_ms   = round(percentile(_predict_latencies_ms, 50),  3),
+        p95_latency_ms   = round(percentile(_predict_latencies_ms, 95),  3),
+        p99_latency_ms   = round(percentile(_predict_latencies_ms, 99),  3),
+        explain_p50_ms   = round(percentile(_explain_latencies_ms, 50),  3),
+        explain_p99_ms   = round(percentile(_explain_latencies_ms, 99),  3),
+        pending_explains = max(0, _counters["total_requests"] - len(_explanation_cache)),
+    )
+
+
+@app.get(
+    "/model/info",
+    summary="Model metadata",
+    description="Return model version, threshold, feature list, and cost model.",
+)
+async def model_info() -> Dict[str, Any]:
+    """Return model metadata for audit and governance.
+
+    Paper: "version pins, and provenance of data" must be logged with
+    every decision.
+    """
+    return {
+        "model_version"    : _registry.model_version,
+        "tau_star"         : _registry.tau_star,
+        "embedding_dim"    : _registry.embedding_dim,
+        "n_features"       : len(_registry.feature_cols),
+        "feature_cols"     : _registry.feature_cols,
+        "calibrator"       : "isotonic_regression",
+        "ensemble_backend" : getattr(_registry.ensemble_head, "backend", "unknown"),
+        "shap_available"   : _registry.shap_explainer is not None,
+        "device"           : str(DEVICE),
+        "max_batch_size"   : MAX_BATCH_SIZE,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Middleware — per-request timing log
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every request with method, path, status code, and duration."""
+    t0       = time.perf_counter()
+    response = await call_next(request)
+    duration = (time.perf_counter() - t0) * 1000
+    logger.debug(
+        "%s %s → %d  (%.2f ms)",
+        request.method, request.url.path,
+        response.status_code, duration,
+    )
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Entry point for direct execution
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "src.inference:app",
+        host    = "0.0.0.0",
+        port    = 8000,
+        workers = 1,           # single worker for CPU-bound models
+        reload  = False,
+        log_level = "info",
+    )
