@@ -1,0 +1,93 @@
+# requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependencies for:
+# "A Hybrid Deep Learning and Explainable AI Framework for Real-Time
+#  Financial Fraud Detection in Dynamic Environments"
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# Python version: 3.9 – 3.11  (3.10 recommended)
+#
+# Sections
+# ────────
+#   1. Deep learning          — DNN encoder (model.py)
+#   2. Gradient boosting      — ensemble head (ensemble.py)
+#   3. Explainability         — SHAP pipeline (shap_explainer.py)
+#   4. Hyperparameter search  — Bayesian optimisation (ensemble.py)
+#   5. Machine learning       — preprocessing, calibration, metrics
+#   6. Class imbalance        — SMOTE oversampling (preprocessing.py)
+#   7. Scientific computing   — numerical utilities
+#   8. Data handling          — DataFrames, serialisation
+#   9. Visualisation          — figures and plots
+#  10. Serving                — FastAPI inference server (inference.py)
+#  11. Development            — notebooks, testing, code quality
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── 1. Deep learning — DNN encoder ───────────────────────────────────────────
+# CPU-only build keeps the Docker image small; paper reports single-digit ms
+# on commodity CPUs without GPU.  Swap for torch+cu121 for GPU deployment.
+torch==2.3.1
+# torch==2.3.1+cu121  # <- uncomment for CUDA 12.1 GPU support
+
+
+# ── 2. Gradient boosting — ensemble head ─────────────────────────────────────
+# Both backends are supported; XGBoost is the paper's primary choice.
+xgboost==2.0.3
+lightgbm==4.3.0
+
+
+# ── 3. Explainability — SHAP pipeline ────────────────────────────────────────
+# TreeSHAP (used by shap_explainer.py) is built into the shap package.
+# Version 0.44+ includes the TreeExplainer.expected_value fix for XGBoost 2.x.
+shap==0.45.1
+
+
+# ── 4. Hyperparameter search — Bayesian optimisation ─────────────────────────
+# TPE sampler used in ensemble.py; 30 trials per fold as described in paper.
+optuna==3.6.1
+
+
+# ── 5. Machine learning — sklearn (preprocessing, calibration, metrics) ──────
+scikit-learn==1.4.2
+
+
+# ── 6. Class imbalance — SMOTE oversampling ──────────────────────────────────
+# Paper: "SMOTE (Synthetic Minority Oversampling Technique) to sample minority
+# class and not alter distributions of features."
+imbalanced-learn==0.12.3
+
+
+# ── 7. Scientific computing ───────────────────────────────────────────────────
+numpy==1.26.4
+scipy==1.13.1
+
+
+# ── 8. Data handling ──────────────────────────────────────────────────────────
+pandas==2.2.2
+joblib==1.4.2
+
+
+# ── 9. Visualisation ──────────────────────────────────────────────────────────
+matplotlib==3.9.0
+seaborn==0.13.2
+
+
+# ── 10. Serving — FastAPI inference server ────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.1
+python-multipart==0.0.9
+
+
+# ── 11. Development — notebooks, testing, code quality ───────────────────────
+jupyter==1.0.0
+ipykernel==6.29.4
+notebook==7.2.0
+pytest==8.2.2
+pytest-asyncio==0.23.7
+httpx==0.27.0
+black==24.4.2
+isort==5.13.2
+flake8==7.0.0
