@@ -1,0 +1,1186 @@
+"""
+ensemble.py
+===========
+Gradient-boosted tree ensemble — Stage 2 of the hybrid fraud detection
+framework.
+
+Paper
+-----
+"A Hybrid Deep Learning and Explainable AI Framework for Real-Time
+Financial Fraud Detection in Dynamic Environments"
+
+Role in the hybrid pipeline
+----------------------------
+This module implements f_w : R^k -> [0,1], the decision layer that
+receives the DNN latent embedding z = phi_theta(x) from Stage 1
+(model.py) and produces a calibrated fraud probability score:
+
+    s = f_w(z)  =  P_hat(y = 1 | z)
+
+followed by a cost-optimal threshold decision:
+
+    delta*(x) = 1  iff  P_hat(y = 1 | z) >= tau*
+    tau* = c_FP / (c_FP + c_FN)
+
+Paper references (System Model & Methodology sections)
+------------------------------------------------------
+"The decision layer uses a gradient-boosted tree ensemble trained on
+the fused representation z to produce a score."
+
+"The depth of the tree, number of estimators and the learning rate
+were optimized (Bayesian optimization) to trade off predictive accuracy
+and inference speed."
+
+"An isotonic regressor with the latest validation window is used to
+score-calibrate the scores so they match the observed frequencies, and
+then a cost-sensitive threshold tau* is used."
+
+"Cost-sensitive analysis, at real cost ratios, where the cost of a
+missed fraud is as many as 100 times the cost of a false alert, shows
+that the hybrid model saves financial loss per 100,000 transactions."
+
+Design decisions
+----------------
+1.  Both XGBoost and LightGBM are supported.  The paper benchmarks
+    both; the EnsembleHead class wraps either backend uniformly.
+2.  Bayesian hyperparameter search via Optuna optimises PR-AUC
+    (not ROC-AUC) because PR-AUC is more informative under extreme
+    class imbalance (paper: "particular attention is paid to recall").
+3.  Isotonic regression calibration reduces ECE from ~6% to <2%
+    as reported in Table 2.
+4.  Cost-sensitive threshold tau* = c_FP / (c_FP + c_FN) is derived
+    from Lemma 1 in the paper and applied after calibration.
+5.  scale_pos_weight (XGBoost) / scale_pos_weight (LightGBM) handle
+    the raw class imbalance in the embedding space.
+
+Usage
+-----
+    from src.ensemble import EnsembleHead, train_ensemble_fold, train_all_folds
+
+    # Train on DNN embeddings from a single fold
+    head, history = train_ensemble_fold(
+        Z_train, y_train, Z_val, y_val,
+        backend="xgboost",
+        n_trials=30,
+    )
+
+    # Score new embeddings
+    probs     = head.predict_proba(Z_test)      # calibrated probabilities
+    decisions = head.predict(Z_test)            # 0 / 1 using tau*
+    cost      = head.cost_per_100k(y_test, Z_test)
+
+    # Save / load
+    head.save("results/models/ensemble_fold0.pkl")
+    head = EnsembleHead.load("results/models/ensemble_fold0.pkl")
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+import joblib
+import lightgbm as lgb
+import numpy as np
+import optuna
+import xgboost as xgb
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.filterwarnings("ignore")
+
+logger = logging.getLogger(__name__)
+
+# ── Type alias ────────────────────────────────────────────────────────────────
+Backend = Literal["xgboost", "lightgbm"]
+
+# ── Default cost model (paper: c_FN >> c_FP, ratio ~100:1) ───────────────────
+DEFAULT_COST_FN: float = 100.0   # cost of a missed fraud (false negative)
+DEFAULT_COST_FP: float = 1.0     # cost of a false alarm  (false positive)
+
+# ── Bayesian search budget ────────────────────────────────────────────────────
+DEFAULT_N_TRIALS: int = 30
+
+# ── Fallback scale_pos_weight if ratio cannot be computed ────────────────────
+_FALLBACK_SPW: float = 100.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Evaluation helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def evaluate_predictions(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    threshold: float = 0.5,
+    cost_fn: float = DEFAULT_COST_FN,
+    cost_fp: float = DEFAULT_COST_FP,
+) -> Dict[str, float]:
+    """Compute the full set of evaluation metrics reported in the paper.
+
+    Covers Table 1 (accuracy, precision, recall, F1, ROC-AUC, PR-AUC),
+    Table 2 (Brier score), and the cost-per-100k metric discussed in the
+    Results Discussion section.
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (N,)
+        Ground-truth binary labels (0 = legitimate, 1 = fraud).
+    y_prob : np.ndarray, shape (N,)
+        Predicted fraud probabilities in [0, 1].
+    threshold : float, default 0.5
+        Decision threshold applied to convert probabilities to labels.
+        Use cost_optimal_threshold() for the paper's tau*.
+    cost_fn : float
+        Cost of a missed fraud (false negative).
+    cost_fp : float
+        Cost of a false alarm (false positive).
+
+    Returns
+    -------
+    Dict[str, float]
+        Keys: accuracy, precision, recall, f1, roc_auc, pr_auc,
+        brier, cost_per_100k, tp, tn, fp, fn.
+    """
+    y_pred = (y_prob >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    cost = (fn * cost_fn + fp * cost_fp) / len(y_true) * 100_000
+
+    return {
+        "accuracy"      : accuracy_score(y_true, y_pred),
+        "precision"     : precision_score(y_true, y_pred, zero_division=0),
+        "recall"        : recall_score(y_true, y_pred, zero_division=0),
+        "f1"            : f1_score(y_true, y_pred, zero_division=0),
+        "roc_auc"       : roc_auc_score(y_true, y_prob),
+        "pr_auc"        : average_precision_score(y_true, y_prob),
+        "brier"         : brier_score_loss(y_true, y_prob),
+        "cost_per_100k" : cost,
+        "tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn),
+    }
+
+
+def cost_optimal_threshold(
+    cost_fn: float = DEFAULT_COST_FN,
+    cost_fp: float = DEFAULT_COST_FP,
+) -> float:
+    """Compute the Bayes-optimal decision threshold tau* from asymmetric costs.
+
+    From Lemma 1 in the paper (System Model section):
+
+        tau* = c_FP / (c_FP + c_FN)
+
+    The optimal policy is to predict fraud when P_hat(y=1|z) >= tau*.
+    This minimises expected cost R(delta) over all measurable rules.
+
+    Parameters
+    ----------
+    cost_fn : float
+        Cost of missing a fraud (false negative).  Paper uses 100.
+    cost_fp : float
+        Cost of a false alarm (false positive).  Paper uses 1.
+
+    Returns
+    -------
+    float
+        Cost-optimal threshold tau* in (0, 1).
+
+    Examples
+    --------
+    >>> cost_optimal_threshold(cost_fn=100.0, cost_fp=1.0)
+    0.0099...   # very low -> maximises recall
+    """
+    return cost_fp / (cost_fp + cost_fn)
+
+
+def expected_calibration_error(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = 10,
+) -> float:
+    """Expected Calibration Error (ECE) as a percentage.
+
+    Paper Table 2 reports ECE before/after isotonic calibration:
+    Credit Card: 6.1% -> 2.0%, IEEE-CIS: 7.5% -> 2.5%, PaySim: 5.8% -> 1.9%.
+
+        ECE = sum_b (|B_b| / N) * |acc_b - conf_b|
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Binary ground-truth labels.
+    y_prob : np.ndarray
+        Predicted probabilities.
+    n_bins : int, default 10
+        Number of equal-width probability bins.
+
+    Returns
+    -------
+    float
+        ECE as a percentage.
+    """
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    n   = len(y_true)
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi)
+        if mask.sum() == 0:
+            continue
+        acc  = y_true[mask].mean()
+        conf = y_prob[mask].mean()
+        ece += (mask.sum() / n) * abs(acc - conf)
+    return ece * 100.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hyperparameter search spaces
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _suggest_xgboost_params(
+    trial: optuna.Trial,
+    scale_pos_weight: float,
+) -> Dict[str, Any]:
+    """Suggest XGBoost hyperparameters for a single Optuna trial.
+
+    Search space covers the three axes named in the paper ("depth of the
+    tree, number of estimators and the learning rate") plus regularisation
+    terms to prevent overfitting on the embedding space.
+
+    Parameters
+    ----------
+    trial : optuna.Trial
+        Active Optuna trial object.
+    scale_pos_weight : float
+        Ratio of negative to positive samples; handles class imbalance.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Full hyperparameter dict ready to pass to XGBClassifier.
+    """
+    return {
+        "n_estimators"      : trial.suggest_int("n_estimators", 100, 800),
+        "max_depth"         : trial.suggest_int("max_depth", 3, 9),
+        "learning_rate"     : trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "subsample"         : trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree"  : trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "colsample_bylevel" : trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+        "min_child_weight"  : trial.suggest_int("min_child_weight", 1, 20),
+        "gamma"             : trial.suggest_float("gamma", 0.0, 5.0),
+        "reg_alpha"         : trial.suggest_float("reg_alpha", 1e-6, 10.0, log=True),
+        "reg_lambda"        : trial.suggest_float("reg_lambda", 1e-6, 10.0, log=True),
+        "scale_pos_weight"  : scale_pos_weight,
+        "objective"         : "binary:logistic",
+        "eval_metric"       : "aucpr",
+        "tree_method"       : "hist",
+        "use_label_encoder" : False,
+        "random_state"      : 42,
+        "n_jobs"            : -1,
+        "verbosity"         : 0,
+    }
+
+
+def _suggest_lightgbm_params(
+    trial: optuna.Trial,
+    scale_pos_weight: float,
+) -> Dict[str, Any]:
+    """Suggest LightGBM hyperparameters for a single Optuna trial.
+
+    Parameters
+    ----------
+    trial : optuna.Trial
+        Active Optuna trial object.
+    scale_pos_weight : float
+        Weight assigned to positive (fraud) class samples.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Full hyperparameter dict ready to pass to LGBMClassifier.
+    """
+    return {
+        "n_estimators"      : trial.suggest_int("n_estimators", 100, 800),
+        "max_depth"         : trial.suggest_int("max_depth", 3, 9),
+        "learning_rate"     : trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "num_leaves"        : trial.suggest_int("num_leaves", 15, 127),
+        "subsample"         : trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree"  : trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "min_child_samples" : trial.suggest_int("min_child_samples", 5, 100),
+        "reg_alpha"         : trial.suggest_float("reg_alpha", 1e-6, 10.0, log=True),
+        "reg_lambda"        : trial.suggest_float("reg_lambda", 1e-6, 10.0, log=True),
+        "scale_pos_weight"  : scale_pos_weight,
+        "objective"         : "binary",
+        "metric"            : "average_precision",
+        "boosting_type"     : "gbdt",
+        "random_state"      : 42,
+        "n_jobs"            : -1,
+        "verbose"           : -1,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EnsembleHead — the main class
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class EnsembleHead:
+    """Gradient-boosted ensemble head — Stage 2 of the hybrid pipeline.
+
+    Wraps either XGBoost or LightGBM and adds:
+    - Bayesian hyperparameter optimisation via Optuna TPE sampler
+    - Isotonic regression post-hoc calibration (ECE ~6% -> <2%)
+    - Cost-optimal threshold tau* from the paper's Lemma 1
+    - Full evaluation suite matching Tables 1 and 2
+
+    The fitted object stores the classifier, calibrator, threshold, and
+    best hyperparameters so a single save()/load() roundtrip is enough
+    for deployment.
+
+    Parameters
+    ----------
+    backend : {"xgboost", "lightgbm"}, default "xgboost"
+        Gradient boosting library to use.
+    cost_fn : float, default 100.0
+        Cost of a missed fraud (false negative).  Used to derive tau*.
+    cost_fp : float, default 1.0
+        Cost of a false alarm (false positive).  Used to derive tau*.
+    n_trials : int, default 30
+        Number of Bayesian search trials.
+    random_state : int, default 42
+        Seed for Optuna and the underlying boosting library.
+    """
+
+    def __init__(
+        self,
+        backend: Backend = "xgboost",
+        cost_fn: float = DEFAULT_COST_FN,
+        cost_fp: float = DEFAULT_COST_FP,
+        n_trials: int = DEFAULT_N_TRIALS,
+        random_state: int = 42,
+    ) -> None:
+        if backend not in ("xgboost", "lightgbm"):
+            raise ValueError(
+                f"backend must be 'xgboost' or 'lightgbm', got {backend!r}."
+            )
+
+        self.backend      = backend
+        self.cost_fn      = cost_fn
+        self.cost_fp      = cost_fp
+        self.n_trials     = n_trials
+        self.random_state = random_state
+
+        # Populated by fit()
+        self.clf_              : Optional[Any]                = None
+        self.calibrator_       : Optional[IsotonicRegression] = None
+        self.threshold_        : float = cost_optimal_threshold(cost_fn, cost_fp)
+        self.best_params_      : Dict[str, Any] = {}
+        self.best_pr_auc_      : float = 0.0
+        self.scale_pos_weight_ : float = _FALLBACK_SPW
+
+    # ── Core public API ───────────────────────────────────────────────────────
+
+    def fit(
+        self,
+        Z_train: np.ndarray,
+        y_train: np.ndarray,
+        Z_val: np.ndarray,
+        y_val: np.ndarray,
+    ) -> "EnsembleHead":
+        """Fit the ensemble: Bayesian search -> retrain best -> calibrate.
+
+        Three-phase procedure
+        ---------------------
+        1. Bayesian hyperparameter search (Optuna TPE, n_trials trials,
+           objective = validation PR-AUC).
+        2. Retrain the best configuration on the full training set with
+           early stopping on the validation fold.
+        3. Fit isotonic regression calibration on (Z_val, y_val) to
+           reduce ECE from ~6% to <2% as reported in Table 2.
+
+        The cost-optimal threshold tau* is computed analytically from the
+        cost model — it does not depend on the validation set.
+
+        Parameters
+        ----------
+        Z_train : np.ndarray, shape (N_train, embedding_dim)
+            DNN embeddings for training transactions (from model.py).
+        y_train : np.ndarray, shape (N_train,)
+            Binary training labels (0 = legit, 1 = fraud).
+        Z_val : np.ndarray, shape (N_val, embedding_dim)
+            DNN embeddings for validation transactions.
+        y_val : np.ndarray, shape (N_val,)
+            Binary validation labels.
+
+        Returns
+        -------
+        self
+            Fitted EnsembleHead (supports method chaining).
+        """
+        # ── Class imbalance ratio for scale_pos_weight ────────────────────────
+        n_neg = int((y_train == 0).sum())
+        n_pos = int((y_train == 1).sum())
+        if n_pos == 0:
+            raise ValueError("Training set contains no fraud samples (y=1).")
+        self.scale_pos_weight_ = n_neg / n_pos
+        logger.info(
+            "Embedding-space class ratio: %d neg / %d pos = %.2fx  (scale_pos_weight)",
+            n_neg, n_pos, self.scale_pos_weight_,
+        )
+
+        # ── Phase 1: Bayesian hyperparameter search ───────────────────────────
+        logger.info(
+            "Starting Bayesian search [%s, %d trials] …",
+            self.backend, self.n_trials,
+        )
+        t0 = time.perf_counter()
+        self.best_params_ = self._bayesian_search(Z_train, y_train, Z_val, y_val)
+        logger.info(
+            "Search complete in %.1f s.  Best val PR-AUC = %.4f",
+            time.perf_counter() - t0, self.best_pr_auc_,
+        )
+
+        # ── Phase 2: Retrain with best params ─────────────────────────────────
+        logger.info("Retraining with best hyperparameters …")
+        self.clf_ = self._build_classifier(self.best_params_)
+        self._fit_classifier(self.clf_, Z_train, y_train, Z_val, y_val)
+
+        # ── Phase 3: Isotonic calibration on validation fold ─────────────────
+        # Paper: "Calibrating the probability post-hoc based on isotonic
+        # regression that was trained on the validation folds was a vital
+        # step of the pipeline."
+        logger.info("Fitting isotonic calibration …")
+        raw_val_probs    = self._raw_proba(self.clf_, Z_val)
+        self.calibrator_ = IsotonicRegression(out_of_bounds="clip")
+        self.calibrator_.fit(raw_val_probs, y_val)
+
+        ece_before = expected_calibration_error(y_val, raw_val_probs)
+        ece_after  = expected_calibration_error(
+            y_val, self.calibrator_.predict(raw_val_probs)
+        )
+        logger.info(
+            "Calibration: ECE %.2f%% -> %.2f%%  (improvement = %.2f%%)",
+            ece_before, ece_after, ece_before - ece_after,
+        )
+
+        # Analytical cost-optimal threshold (Lemma 1)
+        self.threshold_ = cost_optimal_threshold(self.cost_fn, self.cost_fp)
+        logger.info(
+            "Cost-optimal threshold tau* = %.6f  (c_FN=%.0f, c_FP=%.0f)",
+            self.threshold_, self.cost_fn, self.cost_fp,
+        )
+        return self
+
+    def predict_proba(self, Z: np.ndarray) -> np.ndarray:
+        """Return calibrated fraud probabilities for embedding matrix Z.
+
+        Parameters
+        ----------
+        Z : np.ndarray, shape (N, embedding_dim)
+            DNN embedding vectors output by FraudDNNEncoder.extract_embeddings.
+
+        Returns
+        -------
+        np.ndarray, shape (N,)
+            Calibrated probability P_hat(y=1|z) in (0,1) per transaction.
+
+        Raises
+        ------
+        RuntimeError
+            If called before fit().
+        """
+        self._check_fitted()
+        raw = self._raw_proba(self.clf_, Z)
+        return self.calibrator_.predict(raw).astype(np.float32)
+
+    def predict_proba_uncalibrated(self, Z: np.ndarray) -> np.ndarray:
+        """Return raw (uncalibrated) fraud probabilities.
+
+        Useful for replicating the pre-calibration rows of Table 2 and
+        for visualising reliability diagrams before and after calibration.
+
+        Parameters
+        ----------
+        Z : np.ndarray, shape (N, embedding_dim)
+
+        Returns
+        -------
+        np.ndarray, shape (N,)
+        """
+        self._check_fitted()
+        return self._raw_proba(self.clf_, Z)
+
+    def predict(
+        self,
+        Z: np.ndarray,
+        threshold: Optional[float] = None,
+    ) -> np.ndarray:
+        """Return binary fraud predictions using the cost-optimal threshold.
+
+        Parameters
+        ----------
+        Z : np.ndarray, shape (N, embedding_dim)
+        threshold : float, optional
+            Override tau*.  Defaults to self.threshold_ (cost-optimal).
+
+        Returns
+        -------
+        np.ndarray, shape (N,), dtype int
+            0 = predicted legitimate, 1 = predicted fraud.
+        """
+        tau   = threshold if threshold is not None else self.threshold_
+        probs = self.predict_proba(Z)
+        return (probs >= tau).astype(int)
+
+    def evaluate(
+        self,
+        Z: np.ndarray,
+        y_true: np.ndarray,
+        threshold: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """Evaluate the model on embedding matrix Z.
+
+        Returns the full metrics dictionary (Tables 1 and 2): accuracy,
+        precision, recall, F1, ROC-AUC, PR-AUC, Brier score, ECE, and
+        cost_per_100k.
+
+        Parameters
+        ----------
+        Z : np.ndarray, shape (N, embedding_dim)
+        y_true : np.ndarray, shape (N,)
+        threshold : float, optional
+            Defaults to tau*.
+
+        Returns
+        -------
+        Dict[str, float]
+        """
+        self._check_fitted()
+        tau     = threshold if threshold is not None else self.threshold_
+        probs   = self.predict_proba(Z)
+        metrics = evaluate_predictions(
+            y_true, probs,
+            threshold=tau,
+            cost_fn=self.cost_fn,
+            cost_fp=self.cost_fp,
+        )
+        metrics["ece"] = expected_calibration_error(y_true, probs)
+        return metrics
+
+    def cost_per_100k(
+        self,
+        y_true: np.ndarray,
+        Z: np.ndarray,
+        threshold: Optional[float] = None,
+    ) -> float:
+        """Expected financial cost per 100,000 transactions.
+
+        Paper (Results Discussion):
+            "Cost-sensitive analysis … shows that the hybrid model saves
+            financial loss per 100,000 transactions."
+
+        Parameters
+        ----------
+        y_true : np.ndarray, shape (N,)
+        Z : np.ndarray, shape (N, embedding_dim)
+        threshold : float, optional
+
+        Returns
+        -------
+        float
+        """
+        tau    = threshold if threshold is not None else self.threshold_
+        probs  = self.predict_proba(Z)
+        y_pred = (probs >= tau).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        return (fn * self.cost_fn + fp * self.cost_fp) / len(y_true) * 100_000
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def save(self, path: str | Path) -> None:
+        """Persist the complete fitted EnsembleHead to a single joblib file.
+
+        Saves the classifier, calibrator, threshold, backend name, cost
+        model, and best hyperparameters together so that a single load()
+        call fully restores the serving-ready model.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination .pkl file, e.g. results/models/ensemble_fold0.pkl.
+        """
+        self._check_fitted()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {
+                "clf"              : self.clf_,
+                "calibrator"       : self.calibrator_,
+                "threshold"        : self.threshold_,
+                "backend"          : self.backend,
+                "cost_fn"          : self.cost_fn,
+                "cost_fp"          : self.cost_fp,
+                "best_params"      : self.best_params_,
+                "best_pr_auc"      : self.best_pr_auc_,
+                "scale_pos_weight" : self.scale_pos_weight_,
+                "n_trials"         : self.n_trials,
+                "random_state"     : self.random_state,
+            },
+            path,
+        )
+        logger.info("EnsembleHead saved to %s", path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "EnsembleHead":
+        """Load a saved EnsembleHead from disk.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to a .pkl file created by save().
+
+        Returns
+        -------
+        EnsembleHead
+            Fully restored, inference-ready instance.
+        """
+        ckpt = joblib.load(path)
+        obj  = cls(
+            backend      = ckpt["backend"],
+            cost_fn      = ckpt["cost_fn"],
+            cost_fp      = ckpt["cost_fp"],
+            n_trials     = ckpt["n_trials"],
+            random_state = ckpt["random_state"],
+        )
+        obj.clf_              = ckpt["clf"]
+        obj.calibrator_       = ckpt["calibrator"]
+        obj.threshold_        = ckpt["threshold"]
+        obj.best_params_      = ckpt["best_params"]
+        obj.best_pr_auc_      = ckpt["best_pr_auc"]
+        obj.scale_pos_weight_ = ckpt["scale_pos_weight"]
+        logger.info(
+            "EnsembleHead loaded from %s  (backend=%s, tau*=%.4f)",
+            path, obj.backend, obj.threshold_,
+        )
+        return obj
+
+    def save_params_json(self, path: str | Path) -> None:
+        """Export best hyperparameters to a human-readable JSON file.
+
+        Useful for the paper's supplementary materials and for
+        reproducing the exact model without re-running Bayesian search.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination .json file.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serialisable = {
+            k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
+            for k, v in self.best_params_.items()
+        }
+        with open(path, "w") as fh:
+            json.dump(serialisable, fh, indent=2)
+        logger.info("Best hyperparameters written to %s", path)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _bayesian_search(
+        self,
+        Z_train: np.ndarray,
+        y_train: np.ndarray,
+        Z_val: np.ndarray,
+        y_val: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Run Optuna TPE search; return the best hyperparameter dict.
+
+        Objective function: validation PR-AUC (not ROC-AUC).  The paper
+        explicitly prioritises recall and PR-AUC over ROC-AUC because
+        ROC-AUC can hide poor minority-class performance under extreme
+        imbalance (Results Discussion section).
+        """
+        spw = self.scale_pos_weight_
+
+        def objective(trial: optuna.Trial) -> float:
+            if self.backend == "xgboost":
+                params = _suggest_xgboost_params(trial, spw)
+            else:
+                params = _suggest_lightgbm_params(trial, spw)
+
+            clf = self._build_classifier(params)
+            self._fit_classifier(clf, Z_train, y_train, Z_val, y_val)
+            probs = self._raw_proba(clf, Z_val)
+            return average_precision_score(y_val, probs)
+
+        sampler = optuna.samplers.TPESampler(seed=self.random_state)
+        study   = optuna.create_study(direction="maximize", sampler=sampler)
+        study.optimize(
+            objective,
+            n_trials=self.n_trials,
+            show_progress_bar=False,
+        )
+
+        self.best_pr_auc_ = study.best_value
+        best_trial        = study.best_trial
+
+        # Reconstruct full param dict from the best trial's suggested values
+        if self.backend == "xgboost":
+            best_params = _suggest_xgboost_params(best_trial, spw)
+        else:
+            best_params = _suggest_lightgbm_params(best_trial, spw)
+
+        logger.info(
+            "Best trial %d  PR-AUC=%.4f  %s",
+            best_trial.number,
+            self.best_pr_auc_,
+            {k: v for k, v in best_trial.params.items()},
+        )
+        return best_params
+
+    def _build_classifier(self, params: Dict[str, Any]) -> Any:
+        """Instantiate XGBClassifier or LGBMClassifier from a param dict."""
+        if self.backend == "xgboost":
+            return xgb.XGBClassifier(**params)
+        return lgb.LGBMClassifier(**params)
+
+    def _fit_classifier(
+        self,
+        clf: Any,
+        Z_train: np.ndarray,
+        y_train: np.ndarray,
+        Z_val: np.ndarray,
+        y_val: np.ndarray,
+    ) -> None:
+        """Fit classifier with early stopping on the validation fold.
+
+        Early stopping rounds = 30: training halts when val PR-AUC does
+        not improve for 30 consecutive boosting rounds.  This prevents
+        overfitting and aligns with the paper's latency constraint — fewer
+        trees mean faster inference.
+        """
+        if self.backend == "xgboost":
+            clf.fit(
+                Z_train, y_train,
+                eval_set=[(Z_val, y_val)],
+                early_stopping_rounds=30,
+                verbose=False,
+            )
+        else:
+            clf.fit(
+                Z_train, y_train,
+                eval_set=[(Z_val, y_val)],
+                callbacks=[
+                    lgb.early_stopping(stopping_rounds=30, verbose=False),
+                    lgb.log_evaluation(period=-1),
+                ],
+            )
+
+    @staticmethod
+    def _raw_proba(clf: Any, Z: np.ndarray) -> np.ndarray:
+        """Return raw class-1 probability scores from a fitted classifier."""
+        return clf.predict_proba(Z)[:, 1].astype(np.float64)
+
+    def _check_fitted(self) -> None:
+        """Raise RuntimeError if fit() has not been called."""
+        if self.clf_ is None or self.calibrator_ is None:
+            raise RuntimeError(
+                "EnsembleHead has not been fitted.  Call fit() first."
+            )
+
+    def __repr__(self) -> str:
+        fitted = self.clf_ is not None
+        return (
+            f"EnsembleHead("
+            f"backend={self.backend!r}, "
+            f"cost_fn={self.cost_fn}, cost_fp={self.cost_fp}, "
+            f"n_trials={self.n_trials}, fitted={fitted}, "
+            f"tau*={self.threshold_:.6f})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Training history dataclass
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class EnsembleHistory:
+    """Per-fold training record for the ensemble head.
+
+    Attributes
+    ----------
+    backend : str
+        "xgboost" or "lightgbm".
+    best_params : Dict[str, Any]
+        Hyperparameters selected by Bayesian search.
+    best_pr_auc_search : float
+        Best PR-AUC observed during Bayesian search on the validation fold.
+    metrics_before_cal : Dict[str, float]
+        Full evaluation metrics using raw (uncalibrated) probabilities
+        with tau*.  Corresponds to the pre-calibration column in Table 2.
+    metrics_after_cal : Dict[str, float]
+        Full evaluation metrics after isotonic calibration with tau*.
+        Corresponds to Table 1 and the post-calibration column of Table 2.
+    ece_before : float
+        Expected Calibration Error (%) before isotonic regression.
+    ece_after : float
+        Expected Calibration Error (%) after isotonic regression.
+    training_time_s : float
+        Wall-clock seconds for the complete fit() call.
+    """
+
+    backend            : str             = ""
+    best_params        : Dict[str, Any]  = field(default_factory=dict)
+    best_pr_auc_search : float           = 0.0
+    metrics_before_cal : Dict[str, float] = field(default_factory=dict)
+    metrics_after_cal  : Dict[str, float] = field(default_factory=dict)
+    ece_before         : float           = 0.0
+    ece_after          : float           = 0.0
+    training_time_s    : float           = 0.0
+
+    def summary(self) -> str:
+        """One-line summary string for logging."""
+        mc = self.metrics_after_cal
+        return (
+            f"backend={self.backend}  "
+            f"PR-AUC={mc.get('pr_auc', 0):.4f}  "
+            f"ROC-AUC={mc.get('roc_auc', 0):.4f}  "
+            f"Recall={mc.get('recall', 0) * 100:.1f}%  "
+            f"F1={mc.get('f1', 0) * 100:.1f}%  "
+            f"ECE {self.ece_before:.2f}%->{self.ece_after:.2f}%  "
+            f"Cost/100k={mc.get('cost_per_100k', 0):.1f}  "
+            f"Time={self.training_time_s:.1f}s"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Single-fold training function
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def train_ensemble_fold(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    Z_val: np.ndarray,
+    y_val: np.ndarray,
+    backend: Backend = "xgboost",
+    n_trials: int = DEFAULT_N_TRIALS,
+    cost_fn: float = DEFAULT_COST_FN,
+    cost_fp: float = DEFAULT_COST_FP,
+    random_state: int = 42,
+) -> Tuple[EnsembleHead, EnsembleHistory]:
+    """Train and evaluate the ensemble head for a single cross-validation fold.
+
+    Orchestrates the full Stage 2 training:
+    1. Instantiate EnsembleHead.
+    2. Call fit() -> Bayesian search + retrain + isotonic calibration.
+    3. Record before/after calibration metrics for the paper's tables.
+    4. Return the fitted head and its history.
+
+    Parameters
+    ----------
+    Z_train : np.ndarray, shape (N_train, embedding_dim)
+        Training DNN embeddings (output of FraudDNNEncoder.extract_embeddings).
+    y_train : np.ndarray, shape (N_train,)
+        Binary training labels.
+    Z_val : np.ndarray, shape (N_val, embedding_dim)
+        Validation DNN embeddings.
+    y_val : np.ndarray, shape (N_val,)
+        Binary validation labels.
+    backend : {"xgboost", "lightgbm"}, default "xgboost"
+        Gradient boosting backend.
+    n_trials : int, default 30
+        Number of Bayesian search trials per fold.
+    cost_fn : float, default 100.0
+        Cost of a missed fraud (false negative).
+    cost_fp : float, default 1.0
+        Cost of a false alarm (false positive).
+    random_state : int, default 42
+        Random seed for full reproducibility.
+
+    Returns
+    -------
+    head : EnsembleHead
+        Fully fitted ensemble head (classifier + calibrator + threshold).
+    history : EnsembleHistory
+        Per-fold metrics and timing information.
+
+    Examples
+    --------
+    >>> from src.model import FraudDNNEncoder
+    >>> dnn = FraudDNNEncoder.load("results/models/dnn_fold0.pt")
+    >>> Z_train = dnn.extract_embeddings(X_train)
+    >>> Z_val   = dnn.extract_embeddings(X_val)
+    >>> head, history = train_ensemble_fold(Z_train, y_train, Z_val, y_val)
+    >>> print(history.summary())
+    backend=xgboost  PR-AUC=0.9123  ROC-AUC=0.9940  Recall=93.6% ...
+    """
+    t0   = time.perf_counter()
+    head = EnsembleHead(
+        backend=backend,
+        cost_fn=cost_fn,
+        cost_fp=cost_fp,
+        n_trials=n_trials,
+        random_state=random_state,
+    )
+    head.fit(Z_train, y_train, Z_val, y_val)
+
+    # ── Record metrics before calibration ─────────────────────────────────────
+    raw_probs      = head.predict_proba_uncalibrated(Z_val)
+    metrics_before = evaluate_predictions(
+        y_val, raw_probs,
+        threshold=head.threshold_,
+        cost_fn=cost_fn, cost_fp=cost_fp,
+    )
+    ece_before = expected_calibration_error(y_val, raw_probs)
+
+    # ── Record metrics after calibration ──────────────────────────────────────
+    cal_probs     = head.predict_proba(Z_val)
+    metrics_after = evaluate_predictions(
+        y_val, cal_probs,
+        threshold=head.threshold_,
+        cost_fn=cost_fn, cost_fp=cost_fp,
+    )
+    ece_after = expected_calibration_error(y_val, cal_probs)
+
+    history = EnsembleHistory(
+        backend            = backend,
+        best_params        = head.best_params_,
+        best_pr_auc_search = head.best_pr_auc_,
+        metrics_before_cal = metrics_before,
+        metrics_after_cal  = metrics_after,
+        ece_before         = ece_before,
+        ece_after          = ece_after,
+        training_time_s    = time.perf_counter() - t0,
+    )
+    logger.info("Fold complete.  %s", history.summary())
+    return head, history
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-fold training (full cross-validation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def train_all_folds(
+    fold_data: List[dict],
+    dnn_models: List[Any],
+    backend: Backend = "xgboost",
+    save_dir: Optional[str | Path] = None,
+    **kwargs,
+) -> Tuple[List[EnsembleHead], List[EnsembleHistory]]:
+    """Train the ensemble head across all cross-validation folds.
+
+    For each fold:
+    1. Extract DNN embeddings using the corresponding encoder.
+    2. Call train_ensemble_fold().
+    3. Optionally save the fitted head and best hyperparameters.
+
+    After all folds, logs the cross-fold mean +/- std for PR-AUC,
+    ROC-AUC, Recall, F1, ECE, and cost_per_100k — reproducing the
+    format of Tables 1 and 2 in the paper.
+
+    Parameters
+    ----------
+    fold_data : List[dict]
+        Output of preprocessing.run_pipeline().  Each dict has keys
+        X_train, y_train, X_val, y_val.
+    dnn_models : List[FraudDNNEncoder]
+        Trained DNN encoders from model.train_all_folds().
+        Must have the same length as fold_data.
+    backend : {"xgboost", "lightgbm"}, default "xgboost"
+    save_dir : str or Path, optional
+        If provided, each head is saved as
+        {save_dir}/ensemble_{backend}_fold{k}.pkl and hyperparameters
+        as {save_dir}/hparams_{backend}_fold{k}.json.
+    **kwargs
+        Forwarded to train_ensemble_fold() (e.g. n_trials, cost_fn).
+
+    Returns
+    -------
+    heads : List[EnsembleHead]
+    histories : List[EnsembleHistory]
+
+    Examples
+    --------
+    >>> from src.preprocessing import run_pipeline
+    >>> from src.model import train_all_folds as train_dnn
+    >>> fold_data, feature_cols = run_pipeline("data/creditcard.csv")
+    >>> dnn_models, _ = train_dnn(
+    ...     fold_data, input_dim=len(feature_cols), save_dir="results/models"
+    ... )
+    >>> heads, histories = train_all_folds(
+    ...     fold_data, dnn_models, backend="xgboost", save_dir="results/models"
+    ... )
+    """
+    if len(fold_data) != len(dnn_models):
+        raise ValueError(
+            f"fold_data has {len(fold_data)} folds but dnn_models has "
+            f"{len(dnn_models)} entries.  They must match."
+        )
+
+    heads:     List[EnsembleHead]    = []
+    histories: List[EnsembleHistory] = []
+
+    for fold_idx, (fold, dnn_model) in enumerate(zip(fold_data, dnn_models)):
+        logger.info(
+            "═══ Ensemble Fold %d/%d [%s] ═══",
+            fold_idx + 1, len(fold_data), backend,
+        )
+
+        Z_train = dnn_model.extract_embeddings(fold["X_train"])
+        Z_val   = dnn_model.extract_embeddings(fold["X_val"])
+
+        head, history = train_ensemble_fold(
+            Z_train  = Z_train,
+            y_train  = fold["y_train"],
+            Z_val    = Z_val,
+            y_val    = fold["y_val"],
+            backend  = backend,
+            **kwargs,
+        )
+        heads.append(head)
+        histories.append(history)
+
+        if save_dir is not None:
+            stem = f"{backend}_fold{fold_idx}"
+            head.save(Path(save_dir) / f"ensemble_{stem}.pkl")
+            head.save_params_json(Path(save_dir) / f"hparams_{stem}.json")
+
+    _log_crossfold_summary(histories)
+    return heads, histories
+
+
+def _log_crossfold_summary(histories: List[EnsembleHistory]) -> None:
+    """Log mean +/- std of key metrics across all folds (Table 1/2 format)."""
+    metric_keys = [
+        "pr_auc", "roc_auc", "recall", "f1", "accuracy", "cost_per_100k",
+    ]
+    ece_before_vals = [h.ece_before for h in histories]
+    ece_after_vals  = [h.ece_after  for h in histories]
+
+    logger.info("─── Cross-fold summary (%d folds) ───", len(histories))
+    for key in metric_keys:
+        vals  = [h.metrics_after_cal.get(key, float("nan")) for h in histories]
+        scale = 100 if key in ("recall", "f1", "accuracy") else 1
+        unit  = "%" if scale == 100 else ""
+        logger.info(
+            "  %-18s  mean=%.4f%s  std=%.4f%s",
+            key,
+            np.mean(vals) * scale, unit,
+            np.std(vals)  * scale, unit,
+        )
+    logger.info(
+        "  %-18s  mean=%.2f%%  std=%.2f%%  (before calibration)",
+        "ECE",
+        np.mean(ece_before_vals),
+        np.std(ece_before_vals),
+    )
+    logger.info(
+        "  %-18s  mean=%.2f%%  std=%.2f%%  (after  calibration)",
+        "ECE (calibrated)",
+        np.mean(ece_after_vals),
+        np.std(ece_after_vals),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train the ensemble head (Stage 2) on DNN embeddings "
+            "for the hybrid fraud detection pipeline."
+        )
+    )
+    parser.add_argument(
+        "--processed-dir", type=str, default="data/processed",
+        help="Directory containing fold_data.pkl (preprocessing.py output).",
+    )
+    parser.add_argument(
+        "--models-dir", type=str, default="results/models",
+        help="Directory containing dnn_fold*.pt files (model.py output).",
+    )
+    parser.add_argument(
+        "--save-dir", type=str, default="results/models",
+        help="Directory to save fitted ensemble heads and hyperparameter JSONs.",
+    )
+    parser.add_argument(
+        "--backend", type=str, default="xgboost",
+        choices=["xgboost", "lightgbm"],
+        help="Gradient boosting backend (default: xgboost).",
+    )
+    parser.add_argument(
+        "--n-trials", type=int, default=DEFAULT_N_TRIALS,
+        help=f"Bayesian search trials per fold (default: {DEFAULT_N_TRIALS}).",
+    )
+    parser.add_argument(
+        "--cost-fn", type=float, default=DEFAULT_COST_FN,
+        help=f"Cost of a missed fraud / false negative (default: {DEFAULT_COST_FN}).",
+    )
+    parser.add_argument(
+        "--cost-fp", type=float, default=DEFAULT_COST_FP,
+        help=f"Cost of a false alarm / false positive (default: {DEFAULT_COST_FP}).",
+    )
+    args = parser.parse_args()
+
+    # Late import avoids circular dependency at module level
+    from src.model import FraudDNNEncoder  # noqa: E402
+
+    processed_dir = Path(args.processed_dir)
+    models_dir    = Path(args.models_dir)
+
+    fold_data    = joblib.load(processed_dir / "fold_data.pkl")
+    feature_cols = joblib.load(processed_dir / "feature_cols.pkl")
+
+    dnn_models = [
+        FraudDNNEncoder.load(models_dir / f"dnn_fold{k}.pt")
+        for k in range(len(fold_data))
+    ]
+
+    print(
+        f"Loaded {len(fold_data)} folds  |  {len(feature_cols)} features  |  "
+        f"backend={args.backend}  |  tau*={cost_optimal_threshold(args.cost_fn, args.cost_fp):.4f}"
+    )
+
+    heads, histories = train_all_folds(
+        fold_data  = fold_data,
+        dnn_models = dnn_models,
+        backend    = args.backend,
+        save_dir   = args.save_dir,
+        n_trials   = args.n_trials,
+        cost_fn    = args.cost_fn,
+        cost_fp    = args.cost_fp,
+    )
+
+    print(f"\nDone.  {len(heads)} ensemble heads saved to {args.save_dir}/")
+    for k, h in enumerate(histories):
+        print(f"  Fold {k + 1}: {h.summary()}")
