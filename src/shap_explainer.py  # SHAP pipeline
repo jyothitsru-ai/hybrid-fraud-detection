@@ -1,0 +1,1361 @@
+"""
+shap_explainer.py
+=================
+SHAP-based explainability pipeline for the hybrid fraud detection framework.
+
+Paper
+-----
+"A Hybrid Deep Learning and Explainable AI Framework for Real-Time
+Financial Fraud Detection in Dynamic Environments"
+
+Role in the hybrid pipeline
+----------------------------
+This module sits downstream of Stage 2 (ensemble.py) and wraps the
+fitted XGBoost/LightGBM head with TreeSHAP to produce two kinds of
+explanation artifact for every scored transaction:
+
+    Global explanations  — which embedding dimensions (and, by proxy,
+        which raw input features) drive fraud predictions across the
+        full validation set.  Used for model auditing and regulatory
+        reporting.
+
+    Local explanations   — per-transaction additive decomposition
+        phi_0 + sum_i phi_i(x) = F(x), giving auditors a reason code
+        for every individual alert.
+
+Paper references
+----------------
+"For each decision, SHAP produces an additive explanation:
+ p_hat(x) = sigma(phi_0 + sum_{i=1}^{d} phi_i(x))
+ where phi_i is the Shapley contribution of feature i relative to a
+ background baseline phi_0."  (System Model section)
+
+"Every prediction of the hybrid was accompanied by a SHAP-based
+additive explanation, which was obtained with the help of the TreeSHAP
+algorithm with global feature ranking and transaction-specific
+explanations."  (Experimental Datasets section)
+
+"The global SHAP rankers are always more stable around elements that
+can be termed as domain intuition such as amount of transactions,
+bursts of transactions, and device reuse between accounts."
+(Results Discussion section)
+
+"Rank correlation coefficients in the range of 0.8 to 0.9 indicate
+that it is not an illusion of the sampling but an overall description
+of what the model is all about in its logic."  (Results Discussion)
+
+Lemma 2 (paper) — alignment of SHAP with the cost-optimal threshold
+--------------------------------------------------------------------
+The fraud decision delta*(x) at threshold tau* is equivalent to a
+linear inequality in SHAP space:
+
+    sum_i phi_i(x)  >=  log(tau* / (1 - tau*)) - phi_0
+
+This means every audit query "why was this transaction flagged?" has a
+clean additive answer grounded in the cost model.
+
+Usage
+-----
+    from src.shap_explainer import FraudSHAPExplainer
+
+    # Build explainer from a fitted ensemble head
+    explainer = FraudSHAPExplainer(
+        ensemble_head=head,
+        feature_names=feature_cols,   # original input feature names
+        embedding_dim=32,
+    )
+    explainer.fit(Z_background)       # Z from training embeddings
+
+    # Global importance (Table-style + figures)
+    global_imp = explainer.global_importance(Z_val)
+    explainer.plot_global_bar(global_imp, save_path="results/figures/shap_global.png")
+    explainer.plot_beeswarm(Z_val, save_path="results/figures/shap_beeswarm.png")
+
+    # Local explanation for one transaction
+    record = explainer.explain_transaction(Z_single, fraud_score=0.97)
+    explainer.plot_waterfall(record, save_path="results/figures/shap_waterfall.png")
+
+    # Stability across folds (paper reports Spearman r = 0.8–0.9)
+    stability = explainer.cross_fold_stability(rankings_per_fold)
+
+    # Inference-time explanation artifact (for FastAPI / audit log)
+    artifact = explainer.explanation_artifact(Z_single, transaction_id="TX_001")
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import warnings
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shap
+from scipy.stats import spearmanr
+
+warnings.filterwarnings("ignore")
+logger = logging.getLogger(__name__)
+
+# ── Matplotlib style ──────────────────────────────────────────────────────────
+plt.rcParams.update({
+    "figure.dpi"      : 130,
+    "font.family"     : "DejaVu Sans",
+    "axes.spines.top" : False,
+    "axes.spines.right": False,
+})
+
+# ── Default sample sizes ──────────────────────────────────────────────────────
+#: Default number of background samples used to initialise TreeExplainer.
+DEFAULT_BACKGROUND_SAMPLES: int = 500
+
+#: Default number of validation samples to use when computing global SHAP.
+DEFAULT_EXPLAIN_SAMPLES: int = 2_000
+
+#: Number of top features shown in bar and beeswarm plots.
+DEFAULT_TOP_K: int = 15
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data structures
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class GlobalImportance:
+    """Result of a global SHAP analysis over a validation set.
+
+    Attributes
+    ----------
+    feature_names : List[str]
+        Names of all features in the model's input space (embedding dims).
+    mean_abs_shap : np.ndarray, shape (n_features,)
+        Mean absolute SHAP value per feature across all explained samples.
+        Primary ranking criterion used in the paper's global plots.
+    shap_values : np.ndarray, shape (n_samples, n_features)
+        Full SHAP value matrix; each row is one transaction's attribution
+        vector phi_i(x).
+    base_value : float
+        Model baseline phi_0: the mean prediction over the background set.
+    ranked_features : List[str]
+        Feature names sorted by mean_abs_shap descending.
+    ranked_importances : np.ndarray
+        mean_abs_shap values in the same descending order.
+    n_samples : int
+        Number of transactions explained.
+    """
+
+    feature_names      : List[str]
+    mean_abs_shap      : np.ndarray
+    shap_values        : np.ndarray
+    base_value         : float
+    ranked_features    : List[str]
+    ranked_importances : np.ndarray
+    n_samples          : int
+
+    def top_k(self, k: int = DEFAULT_TOP_K) -> pd.DataFrame:
+        """Return a DataFrame of the top-k most important features.
+
+        Parameters
+        ----------
+        k : int
+            Number of top features to return.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: feature, mean_abs_shap.  Sorted descending.
+        """
+        k = min(k, len(self.ranked_features))
+        return pd.DataFrame({
+            "feature"       : self.ranked_features[:k],
+            "mean_abs_shap" : self.ranked_importances[:k],
+        })
+
+    def rank_vector(self) -> np.ndarray:
+        """Return integer ranks (1 = most important) for all features.
+
+        Used by FraudSHAPExplainer.cross_fold_stability() to compute
+        Spearman rank correlations across folds.
+
+        Returns
+        -------
+        np.ndarray, shape (n_features,)
+            Rank of each feature by mean absolute SHAP (1-based).
+        """
+        order = np.argsort(self.mean_abs_shap)[::-1]
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(1, len(order) + 1)
+        return ranks
+
+
+@dataclass
+class LocalExplanation:
+    """SHAP explanation for a single transaction.
+
+    Corresponds to the "local, per-transaction explanation" described in
+    the paper's System Model section (Explainability / SHAP layer).
+
+    Attributes
+    ----------
+    transaction_id : str
+        Caller-supplied identifier (e.g. TransactionID from IEEE-CIS).
+    feature_names : List[str]
+        Names of all embedding dimensions.
+    shap_values : np.ndarray, shape (n_features,)
+        Per-feature Shapley contributions phi_i(x).
+    base_value : float
+        Model baseline phi_0.
+    predicted_value : float
+        Raw model output F(x) = phi_0 + sum_i phi_i(x).  Local accuracy
+        axiom guarantees this equals the classifier's actual output.
+    fraud_score : float
+        Calibrated fraud probability from the ensemble head.
+    decision : int
+        Binary fraud decision (0 or 1) at the cost-optimal threshold.
+    top_positive : List[Tuple[str, float]]
+        Top features that pushed the score towards fraud (phi_i > 0),
+        sorted descending.
+    top_negative : List[Tuple[str, float]]
+        Top features that pushed the score away from fraud (phi_i < 0),
+        sorted ascending (most negative first).
+    """
+
+    transaction_id  : str
+    feature_names   : List[str]
+    shap_values     : np.ndarray
+    base_value      : float
+    predicted_value : float
+    fraud_score     : float
+    decision        : int
+    top_positive    : List[Tuple[str, float]] = field(default_factory=list)
+    top_negative    : List[Tuple[str, float]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise to a JSON-compatible dictionary.
+
+        Returns a flat audit record suitable for logging to a database,
+        API response, or analyst dashboard — matching the paper's
+        description of the governance layer that stores "features, score,
+        threshold, explanation, version pins, and provenance of data".
+
+        Returns
+        -------
+        Dict[str, Any]
+        """
+        return {
+            "transaction_id" : self.transaction_id,
+            "fraud_score"    : round(float(self.fraud_score), 6),
+            "decision"       : int(self.decision),
+            "base_value"     : round(float(self.base_value), 6),
+            "predicted_value": round(float(self.predicted_value), 6),
+            "shap_values"    : {
+                name: round(float(val), 6)
+                for name, val in zip(self.feature_names, self.shap_values)
+            },
+            "top_positive_drivers": [
+                {"feature": f, "shap": round(v, 6)} for f, v in self.top_positive
+            ],
+            "top_negative_drivers": [
+                {"feature": f, "shap": round(v, 6)} for f, v in self.top_negative
+            ],
+        }
+
+    def reason_codes(self, top_n: int = 5) -> List[str]:
+        """Generate human-readable reason codes for analyst dashboards.
+
+        Returns plain-English strings naming the top features that drove
+        the fraud flag, matching the paper's stated goal of giving analysts
+        "a reason behind a single flagged transaction".
+
+        Parameters
+        ----------
+        top_n : int
+            Number of reason codes to return.
+
+        Returns
+        -------
+        List[str]
+            E.g. ['z_04 strongly increased fraud probability (+0.312)',
+                  'z_11 moderately increased fraud probability (+0.187)', ...]
+        """
+        codes = []
+        for feat, val in self.top_positive[:top_n]:
+            magnitude = abs(val)
+            if magnitude > 0.3:
+                strength = "strongly"
+            elif magnitude > 0.1:
+                strength = "moderately"
+            else:
+                strength = "slightly"
+            codes.append(f"{feat} {strength} increased fraud probability ({val:+.3f})")
+        return codes
+
+
+@dataclass
+class StabilityReport:
+    """Cross-fold SHAP stability report.
+
+    Paper: "rank correlation coefficients in the range of 0.8 to 0.9
+    indicate that it is not an illusion of the sampling but an overall
+    description of what the model is all about in its logic."
+
+    Attributes
+    ----------
+    n_folds : int
+        Number of cross-validation folds compared.
+    corr_matrix : np.ndarray, shape (n_folds, n_folds)
+        Pairwise Spearman rank correlation matrix.
+    mean_corr : float
+        Mean off-diagonal Spearman r.
+    std_corr : float
+        Standard deviation of off-diagonal Spearman r.
+    is_stable : bool
+        True if mean_corr >= stability_threshold (default 0.75).
+    """
+
+    n_folds          : int
+    corr_matrix      : np.ndarray
+    mean_corr        : float
+    std_corr         : float
+    is_stable        : bool
+
+    def summary(self) -> str:
+        return (
+            f"SHAP stability across {self.n_folds} folds: "
+            f"mean Spearman r = {self.mean_corr:.3f} ± {self.std_corr:.3f}  "
+            f"({'STABLE' if self.is_stable else 'UNSTABLE'})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main explainer class
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FraudSHAPExplainer:
+    """TreeSHAP explainer for the hybrid fraud detection ensemble head.
+
+    Wraps shap.TreeExplainer to provide the global and local explanation
+    artifacts described in the paper.  Operates in the embedding space
+    (z dimensions output by the DNN encoder) rather than the raw input
+    space, because TreeSHAP is exact and fast on tree models — the paper
+    notes explanations are generated asynchronously on the serving path,
+    reaching analyst consoles "a few hundred milliseconds" after the
+    synchronous fraud decision.
+
+    All plots are saved to disk in publication-ready quality and match
+    the figures described in the paper (Figure 3 area).
+
+    Parameters
+    ----------
+    ensemble_head : Any
+        A fitted EnsembleHead instance (from ensemble.py).  Must expose
+        a ``clf_`` attribute that is a fitted XGBClassifier or
+        LGBMClassifier.
+    feature_names : List[str]
+        Human-readable names for the embedding dimensions, e.g.
+        ["z_00", "z_01", ...].  Must have length == embedding_dim.
+    embedding_dim : int, default 32
+        Dimensionality of the DNN latent space (must match clf_ input).
+    background_samples : int, default 500
+        Number of samples from the training set used to build the
+        TreeExplainer background distribution.
+    """
+
+    def __init__(
+        self,
+        ensemble_head: Any,
+        feature_names: List[str],
+        embedding_dim: int = 32,
+        background_samples: int = DEFAULT_BACKGROUND_SAMPLES,
+    ) -> None:
+        if not hasattr(ensemble_head, "clf_") or ensemble_head.clf_ is None:
+            raise ValueError(
+                "ensemble_head.clf_ is None.  Pass a fully fitted EnsembleHead."
+            )
+        if len(feature_names) != embedding_dim:
+            raise ValueError(
+                f"len(feature_names)={len(feature_names)} != "
+                f"embedding_dim={embedding_dim}.  They must match."
+            )
+
+        self.ensemble_head     = ensemble_head
+        self.feature_names     = list(feature_names)
+        self.embedding_dim     = embedding_dim
+        self.background_samples = background_samples
+
+        # Populated by fit()
+        self._explainer: Optional[shap.TreeExplainer] = None
+        self._base_value: Optional[float]             = None
+
+    # ── Fitting ───────────────────────────────────────────────────────────────
+
+    def fit(
+        self,
+        Z_background: np.ndarray,
+        random_state: int = 42,
+    ) -> "FraudSHAPExplainer":
+        """Initialise the TreeSHAP explainer with a background distribution.
+
+        TreeSHAP computes Shapley values exactly and in polynomial time
+        for tree models.  The background dataset defines the baseline
+        (phi_0) against which feature contributions are measured.
+
+        Paper: "TreeSHAP algorithm with global feature ranking and
+        transaction-specific explanations."
+
+        Parameters
+        ----------
+        Z_background : np.ndarray, shape (N, embedding_dim)
+            Embedding matrix from the training fold.  A random subsample
+            of size ``background_samples`` is drawn from this.
+        random_state : int, default 42
+            Seed for the background subsample.
+
+        Returns
+        -------
+        self
+            Supports method chaining.
+        """
+        rng = np.random.default_rng(random_state)
+        n   = len(Z_background)
+        k   = min(self.background_samples, n)
+        idx = rng.choice(n, size=k, replace=False)
+        background = Z_background[idx]
+
+        logger.info(
+            "Fitting TreeSHAP explainer on %d background samples "
+            "(drawn from %d training embeddings) …",
+            k, n,
+        )
+        self._explainer = shap.TreeExplainer(
+            self.ensemble_head.clf_,
+            data=background,
+            feature_perturbation="interventional",
+        )
+        self._base_value = float(self._explainer.expected_value)
+        logger.info("TreeSHAP ready.  Base value (phi_0) = %.4f", self._base_value)
+        return self
+
+    # ── Global SHAP ───────────────────────────────────────────────────────────
+
+    def global_importance(
+        self,
+        Z: np.ndarray,
+        sample_size: int = DEFAULT_EXPLAIN_SAMPLES,
+        random_state: int = 42,
+    ) -> GlobalImportance:
+        """Compute global SHAP feature importance over a validation set.
+
+        Draws a random subsample (for speed), computes SHAP values with
+        TreeSHAP, and returns a GlobalImportance object containing the
+        full attribution matrix and ranked feature list.
+
+        Paper: "Global explanations describe which variables, e.g. the
+        volume of transaction or device mismatch, are more likely to be
+        predictive across the entire dataset."
+
+        Parameters
+        ----------
+        Z : np.ndarray, shape (N, embedding_dim)
+            Validation embedding matrix.
+        sample_size : int, default 2000
+            Number of rows to explain (subsampled for speed).
+        random_state : int, default 42
+            Seed for subsampling.
+
+        Returns
+        -------
+        GlobalImportance
+        """
+        self._check_fitted()
+
+        rng = np.random.default_rng(random_state)
+        n   = len(Z)
+        k   = min(sample_size, n)
+        idx = rng.choice(n, size=k, replace=False)
+        Z_sample = Z[idx]
+
+        logger.info("Computing global SHAP values for %d samples …", k)
+        shap_values    = self._explainer.shap_values(Z_sample)
+        mean_abs_shap  = np.abs(shap_values).mean(axis=0)
+
+        order             = np.argsort(mean_abs_shap)[::-1]
+        ranked_features   = [self.feature_names[i] for i in order]
+        ranked_importances = mean_abs_shap[order]
+
+        logger.info(
+            "Global SHAP complete.  Top-3: %s",
+            [(ranked_features[i], f"{ranked_importances[i]:.4f}") for i in range(3)],
+        )
+        return GlobalImportance(
+            feature_names      = self.feature_names,
+            mean_abs_shap      = mean_abs_shap,
+            shap_values        = shap_values,
+            base_value         = self._base_value,
+            ranked_features    = ranked_features,
+            ranked_importances = ranked_importances,
+            n_samples          = k,
+        )
+
+    # ── Local SHAP ────────────────────────────────────────────────────────────
+
+    def explain_transaction(
+        self,
+        z: np.ndarray,
+        fraud_score: float,
+        decision: int = 0,
+        transaction_id: str = "UNKNOWN",
+        top_n: int = 10,
+    ) -> LocalExplanation:
+        """Compute a local SHAP explanation for a single transaction.
+
+        Implements the per-transaction explanation artifact described in
+        the paper's System Model (Explainability section):
+
+            "a local, per-transaction explanation which describes which
+            signals and interactions moved the score either up or down
+            compared to a background baseline."
+
+        Parameters
+        ----------
+        z : np.ndarray, shape (embedding_dim,) or (1, embedding_dim)
+            DNN embedding for the transaction to explain.
+        fraud_score : float
+            Calibrated fraud probability from EnsembleHead.predict_proba().
+        decision : int, default 0
+            Binary fraud decision (0 or 1) at the cost-optimal threshold.
+        transaction_id : str, default "UNKNOWN"
+            Unique identifier for the transaction (for audit logging).
+        top_n : int, default 10
+            Number of top positive/negative drivers to include.
+
+        Returns
+        -------
+        LocalExplanation
+        """
+        self._check_fitted()
+        z = np.atleast_2d(z)
+
+        phi       = self._explainer.shap_values(z)[0]          # shape (embedding_dim,)
+        F_x       = float(self._base_value + phi.sum())        # local accuracy axiom
+
+        # Top drivers: positive = pushed toward fraud, negative = pushed away
+        pos_idx = np.where(phi > 0)[0]
+        neg_idx = np.where(phi < 0)[0]
+
+        top_pos = sorted(
+            [(self.feature_names[i], float(phi[i])) for i in pos_idx],
+            key=lambda t: -t[1],
+        )[:top_n]
+
+        top_neg = sorted(
+            [(self.feature_names[i], float(phi[i])) for i in neg_idx],
+            key=lambda t: t[1],
+        )[:top_n]
+
+        return LocalExplanation(
+            transaction_id  = transaction_id,
+            feature_names   = self.feature_names,
+            shap_values     = phi,
+            base_value      = self._base_value,
+            predicted_value = F_x,
+            fraud_score     = float(fraud_score),
+            decision        = int(decision),
+            top_positive    = top_pos,
+            top_negative    = top_neg,
+        )
+
+    def explain_batch(
+        self,
+        Z: np.ndarray,
+        fraud_scores: np.ndarray,
+        decisions: np.ndarray,
+        transaction_ids: Optional[List[str]] = None,
+        top_n: int = 10,
+    ) -> List[LocalExplanation]:
+        """Compute local SHAP explanations for a batch of transactions.
+
+        Computes all SHAP values in one TreeSHAP call (much faster than
+        calling explain_transaction() in a loop), then wraps each row
+        in a LocalExplanation object.
+
+        Parameters
+        ----------
+        Z : np.ndarray, shape (N, embedding_dim)
+        fraud_scores : np.ndarray, shape (N,)
+            Calibrated fraud probabilities.
+        decisions : np.ndarray, shape (N,)
+            Binary fraud decisions.
+        transaction_ids : List[str], optional
+            IDs for each transaction; defaults to "TX_0000", "TX_0001", ...
+        top_n : int, default 10
+
+        Returns
+        -------
+        List[LocalExplanation]
+            One explanation per row of Z.
+        """
+        self._check_fitted()
+        n = len(Z)
+        if transaction_ids is None:
+            transaction_ids = [f"TX_{i:04d}" for i in range(n)]
+
+        logger.info("Computing batch SHAP explanations for %d transactions …", n)
+        all_phi = self._explainer.shap_values(Z)   # shape (N, embedding_dim)
+
+        explanations = []
+        for i in range(n):
+            phi   = all_phi[i]
+            F_x   = float(self._base_value + phi.sum())
+
+            pos_idx = np.where(phi > 0)[0]
+            neg_idx = np.where(phi < 0)[0]
+            top_pos = sorted(
+                [(self.feature_names[j], float(phi[j])) for j in pos_idx],
+                key=lambda t: -t[1],
+            )[:top_n]
+            top_neg = sorted(
+                [(self.feature_names[j], float(phi[j])) for j in neg_idx],
+                key=lambda t: t[1],
+            )[:top_n]
+
+            explanations.append(LocalExplanation(
+                transaction_id  = transaction_ids[i],
+                feature_names   = self.feature_names,
+                shap_values     = phi,
+                base_value      = self._base_value,
+                predicted_value = F_x,
+                fraud_score     = float(fraud_scores[i]),
+                decision        = int(decisions[i]),
+                top_positive    = top_pos,
+                top_negative    = top_neg,
+            ))
+
+        return explanations
+
+    # ── SHAP stability across folds ───────────────────────────────────────────
+
+    def cross_fold_stability(
+        self,
+        global_importances: List[GlobalImportance],
+        stability_threshold: float = 0.75,
+    ) -> StabilityReport:
+        """Measure SHAP ranking stability across cross-validation folds.
+
+        Computes pairwise Spearman rank correlations between the global
+        mean-|SHAP| rankings from each fold.
+
+        Paper: "rank correlation coefficients in the range of 0.8 to 0.9
+        indicate that it is not an illusion of the sampling but an overall
+        description of what the model is all about in its logic."
+
+        Parameters
+        ----------
+        global_importances : List[GlobalImportance]
+            One GlobalImportance object per fold, computed by calling
+            global_importance() with each fold's validation embeddings.
+        stability_threshold : float, default 0.75
+            Minimum mean Spearman r required for the model to be
+            considered "stable" — set conservatively below the 0.8
+            lower bound reported in the paper.
+
+        Returns
+        -------
+        StabilityReport
+        """
+        n_folds = len(global_importances)
+        if n_folds < 2:
+            raise ValueError("Need at least 2 folds to compute stability.")
+
+        rank_vectors = [gi.rank_vector() for gi in global_importances]
+        corr_matrix  = np.ones((n_folds, n_folds))
+
+        for i in range(n_folds):
+            for j in range(i + 1, n_folds):
+                r, _ = spearmanr(rank_vectors[i], rank_vectors[j])
+                corr_matrix[i, j] = corr_matrix[j, i] = float(r)
+
+        off_diag  = corr_matrix[np.triu_indices(n_folds, k=1)]
+        mean_corr = float(np.mean(off_diag))
+        std_corr  = float(np.std(off_diag))
+
+        report = StabilityReport(
+            n_folds    = n_folds,
+            corr_matrix = corr_matrix,
+            mean_corr  = mean_corr,
+            std_corr   = std_corr,
+            is_stable  = mean_corr >= stability_threshold,
+        )
+        logger.info("%s", report.summary())
+        return report
+
+    # ── Explanation artifact (for inference pipeline) ─────────────────────────
+
+    def explanation_artifact(
+        self,
+        z: np.ndarray,
+        fraud_score: float,
+        decision: int,
+        transaction_id: str,
+        tau_star: float,
+        model_version: str = "v1.0",
+        top_n: int = 5,
+    ) -> Dict[str, Any]:
+        """Build the complete governance-layer artifact for one transaction.
+
+        Implements the audit record described in the paper's deployment
+        blueprint: "a lightweight governance layer stores the entire
+        context of the decision in terms of features, score, threshold,
+        explanation, version pins, and provenance of data."
+
+        The SHAP decision boundary (Lemma 2 in the paper) is also
+        included to give auditors the algebraic basis for the flag:
+
+            sum_i phi_i(x)  >=  log(tau* / (1 - tau*)) - phi_0
+
+        Parameters
+        ----------
+        z : np.ndarray, shape (embedding_dim,) or (1, embedding_dim)
+        fraud_score : float
+            Calibrated probability from EnsembleHead.predict_proba().
+        decision : int
+            0 (legitimate) or 1 (fraud) at threshold tau*.
+        transaction_id : str
+        tau_star : float
+            Cost-optimal threshold used for this decision.
+        model_version : str, default "v1.0"
+        top_n : int, default 5
+            Number of reason codes to include.
+
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-serialisable audit record.
+        """
+        explanation = self.explain_transaction(
+            z, fraud_score, decision, transaction_id, top_n=top_n
+        )
+
+        # Lemma 2: SHAP decision boundary constant
+        logit_tau  = np.log(tau_star / (1.0 - tau_star + 1e-12))
+        boundary   = float(logit_tau - self._base_value)
+        shap_total = float(explanation.shap_values.sum())
+
+        return {
+            "transaction_id"     : transaction_id,
+            "model_version"      : model_version,
+            "fraud_score"        : round(float(fraud_score), 6),
+            "decision"           : int(decision),
+            "decision_label"     : "FRAUD" if decision == 1 else "LEGITIMATE",
+            "threshold_tau_star" : round(float(tau_star), 6),
+            "shap_base_value"    : round(float(self._base_value), 6),
+            "shap_total"         : round(shap_total, 6),
+            "shap_boundary"      : round(boundary, 6),
+            "shap_margin"        : round(shap_total - boundary, 6),
+            "reason_codes"       : explanation.reason_codes(top_n),
+            "top_drivers"        : [
+                {"feature": f, "shap": round(v, 6)}
+                for f, v in (explanation.top_positive + explanation.top_negative)[:top_n]
+            ],
+        }
+
+    # ── Plotting ──────────────────────────────────────────────────────────────
+
+    def plot_global_bar(
+        self,
+        importance: GlobalImportance,
+        top_k: int = DEFAULT_TOP_K,
+        save_path: Optional[str | Path] = None,
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot a horizontal bar chart of global mean |SHAP| importances.
+
+        Corresponds to the global feature importance figure referenced in
+        the paper's Results Discussion section.
+
+        Parameters
+        ----------
+        importance : GlobalImportance
+            Output of global_importance().
+        top_k : int, default 15
+        save_path : str or Path, optional
+        show : bool, default True
+
+        Returns
+        -------
+        plt.Figure
+        """
+        k   = min(top_k, len(importance.ranked_features))
+        names = importance.ranked_features[:k][::-1]   # reverse for horizontal bar
+        vals  = importance.ranked_importances[:k][::-1]
+
+        # Colour gradient: most important = deepest red
+        norm_vals = (vals - vals.min()) / (vals.max() - vals.min() + 1e-12)
+        colours   = plt.cm.RdYlGn_r(0.2 + 0.6 * norm_vals)
+
+        fig, ax = plt.subplots(figsize=(9, 6))
+        bars = ax.barh(range(k), vals, color=colours, edgecolor="#333333",
+                       linewidth=0.4, height=0.7)
+
+        ax.set_yticks(range(k))
+        ax.set_yticklabels(names, fontsize=10)
+        ax.set_xlabel("Mean |SHAP value|", fontsize=11)
+        ax.set_title(
+            f"Global SHAP Feature Importance — Top {k} Embedding Dimensions\n"
+            f"({importance.n_samples:,} validation samples  |  "
+            f"base value φ₀ = {importance.base_value:.4f})",
+            fontsize=11, fontweight="bold",
+        )
+
+        # Annotate bars with values
+        for bar, val in zip(bars, vals):
+            ax.text(
+                val + vals.max() * 0.01,
+                bar.get_y() + bar.get_height() / 2,
+                f"{val:.4f}",
+                va="center", fontsize=8, color="#333",
+            )
+
+        plt.tight_layout()
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight")
+            logger.info("Global bar plot saved to %s", save_path)
+        if show:
+            plt.show()
+        return fig
+
+    def plot_beeswarm(
+        self,
+        Z: np.ndarray,
+        sample_size: int = DEFAULT_EXPLAIN_SAMPLES,
+        top_k: int = DEFAULT_TOP_K,
+        save_path: Optional[str | Path] = None,
+        show: bool = True,
+        random_state: int = 42,
+    ) -> plt.Figure:
+        """Plot a SHAP beeswarm (summary) plot for the validation set.
+
+        Shows the distribution of SHAP values across all explained
+        transactions for each feature: colour encodes feature value
+        (red = high, blue = low), x-axis shows impact on model output.
+
+        Paper: global SHAP analysis uses beeswarm plots to show both
+        the magnitude and direction of each feature's effect.
+
+        Parameters
+        ----------
+        Z : np.ndarray, shape (N, embedding_dim)
+        sample_size : int, default 2000
+        top_k : int, default 15
+        save_path : str or Path, optional
+        show : bool, default True
+        random_state : int, default 42
+
+        Returns
+        -------
+        plt.Figure
+        """
+        self._check_fitted()
+        rng = np.random.default_rng(random_state)
+        k   = min(sample_size, len(Z))
+        idx = rng.choice(len(Z), size=k, replace=False)
+        Z_s = Z[idx]
+
+        shap_values = self._explainer.shap_values(Z_s)
+        fig = plt.figure(figsize=(10, 7))
+        shap.summary_plot(
+            shap_values,
+            Z_s,
+            feature_names=self.feature_names,
+            max_display=top_k,
+            show=False,
+        )
+        plt.title(
+            f"SHAP Beeswarm Plot — Embedding Dimensions\n"
+            f"({k:,} samples  |  top {top_k} features shown)",
+            fontsize=11, fontweight="bold", pad=14,
+        )
+        plt.tight_layout()
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight")
+            logger.info("Beeswarm plot saved to %s", save_path)
+        if show:
+            plt.show()
+        return fig
+
+    def plot_waterfall(
+        self,
+        explanation: LocalExplanation,
+        max_display: int = 15,
+        save_path: Optional[str | Path] = None,
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot a SHAP waterfall chart for a single transaction.
+
+        Shows exactly how each feature's contribution phi_i(x) moved the
+        prediction from the baseline phi_0 to the final score F(x),
+        implementing the paper's "local, per-transaction explanation which
+        describes which signals and interactions moved the score either
+        up or down compared to a background baseline."
+
+        Parameters
+        ----------
+        explanation : LocalExplanation
+            Output of explain_transaction().
+        max_display : int, default 15
+            Maximum number of features to show (remaining are grouped).
+        save_path : str or Path, optional
+        show : bool, default True
+
+        Returns
+        -------
+        plt.Figure
+        """
+        shap_exp = shap.Explanation(
+            values        = explanation.shap_values,
+            base_values   = explanation.base_value,
+            data          = explanation.shap_values,   # values as proxy for data
+            feature_names = explanation.feature_names,
+        )
+
+        fig = plt.figure(figsize=(10, 7))
+        shap.waterfall_plot(shap_exp, max_display=max_display, show=False)
+        plt.title(
+            f"SHAP Waterfall — Transaction {explanation.transaction_id}\n"
+            f"Fraud score: {explanation.fraud_score:.4f}  |  "
+            f"Decision: {'FRAUD' if explanation.decision else 'LEGITIMATE'}",
+            fontsize=11, fontweight="bold", pad=14,
+        )
+        plt.tight_layout()
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight")
+            logger.info("Waterfall plot saved to %s", save_path)
+        if show:
+            plt.show()
+        return fig
+
+    def plot_force(
+        self,
+        explanation: LocalExplanation,
+        save_path: Optional[str | Path] = None,
+    ) -> None:
+        """Save an interactive SHAP force plot as an HTML file.
+
+        The force plot shows each feature's SHAP value as a force either
+        pushing toward or pulling away from fraud, stacked from the
+        baseline to the final score.  Saves as HTML for analyst dashboards.
+
+        Parameters
+        ----------
+        explanation : LocalExplanation
+        save_path : str or Path, optional
+            Destination .html file.  Defaults to shap_force_<id>.html in
+            the current directory.
+        """
+        shap.initjs()
+        force = shap.force_plot(
+            explanation.base_value,
+            explanation.shap_values,
+            explanation.shap_values,
+            feature_names=explanation.feature_names,
+            show=False,
+        )
+        if save_path is None:
+            save_path = f"shap_force_{explanation.transaction_id}.html"
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        shap.save_html(str(save_path), force)
+        logger.info("Force plot saved to %s", save_path)
+
+    def plot_stability_heatmap(
+        self,
+        report: StabilityReport,
+        save_path: Optional[str | Path] = None,
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot the pairwise Spearman correlation heatmap across folds.
+
+        Visualises the cross-fold SHAP stability result from
+        cross_fold_stability(), showing the rank correlation matrix.
+
+        Parameters
+        ----------
+        report : StabilityReport
+            Output of cross_fold_stability().
+        save_path : str or Path, optional
+        show : bool, default True
+
+        Returns
+        -------
+        plt.Figure
+        """
+        import seaborn as sns
+
+        n = report.n_folds
+        labels = [f"Fold {i + 1}" for i in range(n)]
+
+        fig, ax = plt.subplots(figsize=(max(4, n + 1), max(4, n + 1)))
+        sns.heatmap(
+            report.corr_matrix,
+            annot=True,
+            fmt=".3f",
+            cmap="RdYlGn",
+            vmin=0.0,
+            vmax=1.0,
+            linewidths=0.5,
+            xticklabels=labels,
+            yticklabels=labels,
+            ax=ax,
+            annot_kws={"size": 10},
+        )
+        ax.set_title(
+            f"SHAP Global Ranking Stability\n"
+            f"(Spearman r — {n} folds)  "
+            f"mean = {report.mean_corr:.3f} ± {report.std_corr:.3f}",
+            fontsize=11, fontweight="bold",
+        )
+        plt.tight_layout()
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight")
+            logger.info("Stability heatmap saved to %s", save_path)
+        if show:
+            plt.show()
+        return fig
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def save(self, path: str | Path) -> None:
+        """Persist the fitted explainer to disk.
+
+        Saves the TreeExplainer, feature names, embedding dimension, and
+        base value in a single joblib file.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination .pkl file.
+        """
+        self._check_fitted()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {
+                "explainer"         : self._explainer,
+                "base_value"        : self._base_value,
+                "feature_names"     : self.feature_names,
+                "embedding_dim"     : self.embedding_dim,
+                "background_samples": self.background_samples,
+            },
+            path,
+        )
+        logger.info("FraudSHAPExplainer saved to %s", path)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        ensemble_head: Any,
+    ) -> "FraudSHAPExplainer":
+        """Load a previously saved explainer from disk.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to a .pkl file created by save().
+        ensemble_head : Any
+            The corresponding fitted EnsembleHead (needed for the class
+            constructor, though the TreeExplainer itself is stored in
+            the checkpoint).
+
+        Returns
+        -------
+        FraudSHAPExplainer
+        """
+        ckpt = joblib.load(path)
+        obj  = cls(
+            ensemble_head      = ensemble_head,
+            feature_names      = ckpt["feature_names"],
+            embedding_dim      = ckpt["embedding_dim"],
+            background_samples = ckpt["background_samples"],
+        )
+        obj._explainer  = ckpt["explainer"]
+        obj._base_value = ckpt["base_value"]
+        logger.info("FraudSHAPExplainer loaded from %s", path)
+        return obj
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _check_fitted(self) -> None:
+        """Raise RuntimeError if fit() has not been called."""
+        if self._explainer is None:
+            raise RuntimeError(
+                "FraudSHAPExplainer has not been fitted.  Call fit() first."
+            )
+
+    def __repr__(self) -> str:
+        fitted = self._explainer is not None
+        return (
+            f"FraudSHAPExplainer("
+            f"embedding_dim={self.embedding_dim}, "
+            f"n_features={len(self.feature_names)}, "
+            f"background_samples={self.background_samples}, "
+            f"fitted={fitted}, "
+            f"base_value={self._base_value})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Convenience: full pipeline over all folds
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def run_shap_pipeline(
+    fold_data: List[dict],
+    dnn_models: List[Any],
+    ensemble_heads: List[Any],
+    embedding_dim: int = 32,
+    figures_dir: str | Path = "results/figures",
+    save_explainers: bool = True,
+    explainers_dir: str | Path = "results/models",
+    top_k: int = DEFAULT_TOP_K,
+    explain_samples: int = DEFAULT_EXPLAIN_SAMPLES,
+    background_samples: int = DEFAULT_BACKGROUND_SAMPLES,
+) -> Tuple[List[FraudSHAPExplainer], List[GlobalImportance], StabilityReport]:
+    """Run the full SHAP analysis pipeline across all cross-validation folds.
+
+    For each fold:
+    1. Extract DNN embeddings.
+    2. Build and fit a FraudSHAPExplainer.
+    3. Compute global importance and generate all figures.
+    4. Generate a local waterfall for the highest-confidence fraud case.
+    5. Save the explainer to disk.
+
+    After all folds:
+    6. Compute cross-fold stability (Spearman rank correlation matrix).
+    7. Save the stability heatmap.
+
+    Parameters
+    ----------
+    fold_data : List[dict]
+        Output of preprocessing.run_pipeline().
+    dnn_models : List[FraudDNNEncoder]
+        Trained DNN encoders from model.train_all_folds().
+    ensemble_heads : List[EnsembleHead]
+        Fitted ensemble heads from ensemble.train_all_folds().
+    embedding_dim : int, default 32
+    figures_dir : str or Path, default "results/figures"
+    save_explainers : bool, default True
+    explainers_dir : str or Path, default "results/models"
+    top_k : int, default 15
+    explain_samples : int, default 2000
+    background_samples : int, default 500
+
+    Returns
+    -------
+    explainers : List[FraudSHAPExplainer]
+    global_importances : List[GlobalImportance]
+    stability : StabilityReport
+    """
+    figures_dir    = Path(figures_dir)
+    explainers_dir = Path(explainers_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build embedding-space feature names
+    feature_names = [f"z_{i:02d}" for i in range(embedding_dim)]
+
+    explainers         : List[FraudSHAPExplainer] = []
+    global_importances : List[GlobalImportance]   = []
+
+    for fold_idx, (fold, dnn, head) in enumerate(
+        zip(fold_data, dnn_models, ensemble_heads)
+    ):
+        logger.info("═══ SHAP Fold %d/%d ═══", fold_idx + 1, len(fold_data))
+
+        Z_train = dnn.extract_embeddings(fold["X_train"])
+        Z_val   = dnn.extract_embeddings(fold["X_val"])
+        y_val   = fold["y_val"]
+
+        # ── Build and fit explainer ────────────────────────────────────────
+        explainer = FraudSHAPExplainer(
+            ensemble_head      = head,
+            feature_names      = feature_names,
+            embedding_dim      = embedding_dim,
+            background_samples = background_samples,
+        )
+        explainer.fit(Z_train)
+
+        # ── Global importance ──────────────────────────────────────────────
+        gi = explainer.global_importance(Z_val, sample_size=explain_samples)
+        global_importances.append(gi)
+
+        # ── Figures ────────────────────────────────────────────────────────
+        # Global bar
+        explainer.plot_global_bar(
+            gi, top_k=top_k,
+            save_path=figures_dir / f"shap_global_bar_fold{fold_idx}.png",
+            show=False,
+        )
+        # Beeswarm
+        explainer.plot_beeswarm(
+            Z_val, sample_size=min(explain_samples, len(Z_val)),
+            top_k=top_k,
+            save_path=figures_dir / f"shap_beeswarm_fold{fold_idx}.png",
+            show=False,
+        )
+        # Waterfall for highest-confidence fraud
+        fraud_indices = np.where(y_val == 1)[0]
+        if len(fraud_indices) > 0:
+            cal_probs  = head.predict_proba(Z_val[fraud_indices])
+            best_idx   = fraud_indices[np.argmax(cal_probs)]
+            local_exp  = explainer.explain_transaction(
+                Z_val[best_idx],
+                fraud_score = float(head.predict_proba(Z_val[[best_idx]])[0]),
+                decision    = 1,
+                transaction_id = f"FOLD{fold_idx}_TOP_FRAUD",
+            )
+            explainer.plot_waterfall(
+                local_exp,
+                save_path=figures_dir / f"shap_waterfall_fold{fold_idx}.png",
+                show=False,
+            )
+            explainer.plot_force(
+                local_exp,
+                save_path=figures_dir / f"shap_force_fold{fold_idx}.html",
+            )
+            logger.info(
+                "Local explanation for top fraud TX: score=%.4f  "
+                "top driver=%s (%.4f)",
+                local_exp.fraud_score,
+                local_exp.top_positive[0][0] if local_exp.top_positive else "n/a",
+                local_exp.top_positive[0][1] if local_exp.top_positive else 0.0,
+            )
+
+        # ── Save explainer ─────────────────────────────────────────────────
+        if save_explainers:
+            explainer.save(explainers_dir / f"shap_explainer_fold{fold_idx}.pkl")
+
+        explainers.append(explainer)
+
+        # Log top-5 features for this fold
+        logger.info("Top-5 features (fold %d):", fold_idx + 1)
+        for feat, val in zip(gi.ranked_features[:5], gi.ranked_importances[:5]):
+            logger.info("  %-12s  mean|SHAP|=%.4f", feat, val)
+
+    # ── Cross-fold stability ───────────────────────────────────────────────
+    # Use first explainer arbitrarily for the method call (stability is
+    # computed purely from the GlobalImportance rank vectors)
+    stability = explainers[0].cross_fold_stability(global_importances)
+    explainers[0].plot_stability_heatmap(
+        stability,
+        save_path=figures_dir / "shap_stability_heatmap.png",
+        show=False,
+    )
+
+    logger.info("SHAP pipeline complete.  %s", stability.summary())
+    return explainers, global_importances, stability
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Run the full SHAP explainability pipeline for the hybrid fraud model."
+    )
+    parser.add_argument(
+        "--processed-dir", type=str, default="data/processed",
+        help="Directory containing fold_data.pkl (preprocessing.py output).",
+    )
+    parser.add_argument(
+        "--models-dir", type=str, default="results/models",
+        help="Directory containing dnn_fold*.pt and ensemble_xgboost_fold*.pkl.",
+    )
+    parser.add_argument(
+        "--figures-dir", type=str, default="results/figures",
+        help="Output directory for all SHAP figures.",
+    )
+    parser.add_argument(
+        "--backend", type=str, default="xgboost",
+        choices=["xgboost", "lightgbm"],
+        help="Backend used when training the ensemble (default: xgboost).",
+    )
+    parser.add_argument(
+        "--embedding-dim", type=int, default=32,
+        help="DNN embedding dimension (default: 32).",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_TOP_K,
+        help=f"Features shown in global plots (default: {DEFAULT_TOP_K}).",
+    )
+    parser.add_argument(
+        "--explain-samples", type=int, default=DEFAULT_EXPLAIN_SAMPLES,
+        help=f"Validation samples to explain (default: {DEFAULT_EXPLAIN_SAMPLES}).",
+    )
+    parser.add_argument(
+        "--background-samples", type=int, default=DEFAULT_BACKGROUND_SAMPLES,
+        help=f"Background samples for TreeExplainer (default: {DEFAULT_BACKGROUND_SAMPLES}).",
+    )
+    args = parser.parse_args()
+
+    # Late imports avoid circular dependency at module level
+    from src.ensemble import EnsembleHead      # noqa: E402
+    from src.model    import FraudDNNEncoder   # noqa: E402
+
+    processed_dir = Path(args.processed_dir)
+    models_dir    = Path(args.models_dir)
+
+    fold_data = joblib.load(processed_dir / "fold_data.pkl")
+    n_folds   = len(fold_data)
+
+    dnn_models = [
+        FraudDNNEncoder.load(models_dir / f"dnn_fold{k}.pt")
+        for k in range(n_folds)
+    ]
+    ensemble_heads = [
+        EnsembleHead.load(models_dir / f"ensemble_{args.backend}_fold{k}.pkl")
+        for k in range(n_folds)
+    ]
+
+    print(
+        f"Loaded {n_folds} folds  |  "
+        f"embedding_dim={args.embedding_dim}  |  "
+        f"backend={args.backend}"
+    )
+
+    explainers, global_importances, stability = run_shap_pipeline(
+        fold_data          = fold_data,
+        dnn_models         = dnn_models,
+        ensemble_heads     = ensemble_heads,
+        embedding_dim      = args.embedding_dim,
+        figures_dir        = args.figures_dir,
+        explainers_dir     = models_dir,
+        top_k              = args.top_k,
+        explain_samples    = args.explain_samples,
+        background_samples = args.background_samples,
+    )
+
+    print(f"\n{stability.summary()}")
+    print(f"All figures saved to {args.figures_dir}/")
+    print("\nTop-5 global features (fold 0):")
+    for row in global_importances[0].top_k(5).itertuples(index=False):
+        print(f"  {row.feature:<12s}  mean|SHAP|={row.mean_abs_shap:.4f}")
