@@ -1,0 +1,1009 @@
+"""
+model.py
+========
+Deep Neural Network (DNN) encoder — Stage 1 of the hybrid fraud
+detection framework.
+
+Paper
+-----
+"A Hybrid Deep Learning and Explainable AI Framework for Real-Time
+Financial Fraud Detection in Dynamic Environments"
+
+Role in the hybrid pipeline
+----------------------------
+This module implements φ_θ : R^d → R^k, the representation-learning
+network whose penultimate layer produces a compact latent embedding
+
+    z = φ_θ(x)  ∈ R^k
+
+that is passed to the gradient-boosted tree ensemble (Stage 2, ensemble.py).
+
+Architecture summary (from paper Section: Proposed Architecture)
+-----------------------------------------------------------------
+"A tabular encoder, which is a shallow-based multilayer perceptron
+trained using dropout and batch normalization, maps the heterogeneous
+snapshot to a dense embedding, which encodes cross-feature interactions
+not achieved by manual engineering."
+
+"The DNN has three to five fully connected hidden layers that have ReLU
+activations and dropout regularizations to deter overfitting.  The
+second to last hidden layer produces an embedding of each transaction,
+but it is compact, containing high level abstractions of both time and
+statistical and engineered features."
+
+Training objective (from paper Section: System Model)
+------------------------------------------------------
+Parameters θ are trained by minimising a class-weighted cross-entropy
+or focal loss:
+
+    L_focal = −Σ [ α·y·(1−p̂)^γ·log(p̂) + (1−α)·(1−y)·p̂^γ·log(1−p̂) ]
+
+with α (class weight) and γ (focusing parameter) tuned to concentrate
+gradient mass on minority fraud examples around the decision boundary.
+
+Usage
+-----
+    # Direct import
+    from src.model import FraudDNNEncoder, FocalLoss, train_one_fold
+
+    # Build encoder
+    model = FraudDNNEncoder(input_dim=37, embedding_dim=32)
+
+    # Extract embeddings for ensemble (Stage 2)
+    z = model.encode(x_batch)            # (B, 32)
+
+    # Full training loop for one fold
+    model, history = train_one_fold(
+        X_train, y_train, X_val, y_val,
+        input_dim=37, embedding_dim=32,
+    )
+
+    # Save / load
+    model.save("results/models/dnn_fold0.pt")
+    model = FraudDNNEncoder.load("results/models/dnn_fold0.pt", input_dim=37)
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import average_precision_score, roc_auc_score
+from torch.utils.data import DataLoader, TensorDataset
+
+logger = logging.getLogger(__name__)
+
+# ── Default hyperparameters (match paper description) ─────────────────────────
+
+#: Hidden layer widths.  Paper: "three to five fully connected hidden layers."
+DEFAULT_HIDDEN_DIMS: List[int] = [256, 128, 64]
+
+#: Dimension of the latent embedding z passed to the tree ensemble.
+DEFAULT_EMBEDDING_DIM: int = 32
+
+#: Dropout probability applied after each hidden layer.
+DEFAULT_DROPOUT: float = 0.3
+
+#: Focal loss α — class weight for the minority (fraud) class.
+DEFAULT_FOCAL_ALPHA: float = 0.25
+
+#: Focal loss γ — focusing parameter; higher → more weight on hard examples.
+DEFAULT_FOCAL_GAMMA: float = 2.0
+
+#: Adam learning rate.
+DEFAULT_LR: float = 1e-3
+
+#: L2 weight decay (Adam optimizer).
+DEFAULT_WEIGHT_DECAY: float = 1e-4
+
+#: Training batch size.
+DEFAULT_BATCH_SIZE: int = 1024
+
+#: Maximum training epochs.
+DEFAULT_EPOCHS: int = 50
+
+#: Early stopping patience (epochs without val AUC improvement).
+DEFAULT_PATIENCE: int = 7
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Loss function
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FocalLoss(nn.Module):
+    """Focal loss for training on severely class-imbalanced data.
+
+    Introduced by Lin et al. (2017) and adopted in this paper to
+    concentrate gradient mass on uncertain, minority-class (fraud)
+    samples near the decision boundary:
+
+        L_focal = −Σ [ α·y·(1−p̂)^γ·log(p̂)
+                      + (1−α)·(1−y)·p̂^γ·log(1−p̂) ]
+
+    The gradient with respect to the pre-sigmoid score s is (fraud class):
+
+        ∂L/∂s = −α [ γ·(1−p̂)^(γ−1)·(−∂p̂/∂s)·log(p̂)
+                    + (1−p̂)^γ·(1/p̂)·(∂p̂/∂s) ]
+
+    where ∂p̂/∂s = p̂·(1−p̂).
+
+    Paper reference (System Model section):
+        "use a cost-sensitive logistic or focal loss on mini-batches …
+        With α (class weight) and γ (focusing) tuned to concentrate
+        gradient mass on minority fraud examples."
+
+    Parameters
+    ----------
+    alpha : float, default 0.25
+        Weighting factor for the minority (fraud, y=1) class.
+        Complementary weight (1−alpha) is applied to the majority class.
+    gamma : float, default 2.0
+        Focusing parameter.  gamma=0 reduces to weighted cross-entropy.
+        Higher values suppress the contribution of easy examples more
+        aggressively.
+    reduction : str, default "mean"
+        Specifies the reduction to apply to the output: ``"none"`` |
+        ``"mean"`` | ``"sum"``.
+    """
+
+    def __init__(
+        self,
+        alpha: float = DEFAULT_FOCAL_ALPHA,
+        gamma: float = DEFAULT_FOCAL_GAMMA,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        if not 0.0 < alpha < 1.0:
+            raise ValueError(f"alpha must be in (0, 1), got {alpha}.")
+        if gamma < 0:
+            raise ValueError(f"gamma must be >= 0, got {gamma}.")
+        if reduction not in ("none", "mean", "sum"):
+            raise ValueError(f"reduction must be 'none', 'mean', or 'sum'.")
+
+        self.alpha     = alpha
+        self.gamma     = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute focal loss between raw logits and binary targets.
+
+        Parameters
+        ----------
+        logits : torch.Tensor, shape (N,) or (N, 1)
+            Raw (pre-sigmoid) model outputs.
+        targets : torch.Tensor, shape (N,)
+            Binary ground-truth labels (0 or 1).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss value (if reduction != "none"), otherwise shape (N,).
+        """
+        logits  = logits.squeeze()
+        targets = targets.float()
+
+        p       = torch.sigmoid(logits)
+        # p_t = p when y=1, (1-p) when y=0
+        p_t     = p * targets + (1.0 - p) * (1.0 - targets)
+        # alpha_t = alpha when y=1, (1-alpha) when y=0
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+
+        # Focal modulating factor: (1 - p_t)^gamma
+        focal_weight = (1.0 - p_t).pow(self.gamma)
+
+        # Binary cross-entropy without reduction
+        bce = -torch.log(p_t.clamp(min=1e-8))
+
+        loss = alpha_t * focal_weight * bce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+    def extra_repr(self) -> str:
+        return f"alpha={self.alpha}, gamma={self.gamma}, reduction={self.reduction!r}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Building blocks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _DenseBlock(nn.Module):
+    """Single fully-connected block: Linear → BatchNorm → ReLU → Dropout.
+
+    Used internally by :class:`FraudDNNEncoder` to build the hidden layers.
+
+    Parameters
+    ----------
+    in_features : int
+        Number of input features.
+    out_features : int
+        Number of output features.
+    dropout : float
+        Dropout probability applied after the activation.
+    """
+
+    def __init__(self, in_features: int, out_features: int, dropout: float) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(in_features, out_features, bias=False),  # bias absorbed by BN
+            nn.BatchNorm1d(out_features),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main encoder
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FraudDNNEncoder(nn.Module):
+    """Tabular DNN encoder — Stage 1 of the hybrid fraud detection pipeline.
+
+    Maps a scaled feature vector x ∈ R^d to a compact latent embedding
+    z ∈ R^k via a stack of fully-connected hidden layers followed by a
+    dedicated embedding layer.  The embedding z is the *only* output
+    consumed by Stage 2 (the gradient-boosted ensemble).  A lightweight
+    classification head is attached solely for Stage 1 training and is
+    discarded at inference time.
+
+    Architecture
+    ------------
+    Input (d)
+      │
+      ▼
+    DenseBlock_1 [in=d,  out=H_1]  ← Linear + BN + ReLU + Dropout
+      │
+      ▼
+    DenseBlock_2 [in=H_1, out=H_2]
+      │
+      ▼
+      …   (up to 5 blocks)
+      │
+      ▼
+    DenseBlock_n [in=H_{n-1}, out=H_n]
+      │
+      ▼
+    EmbeddingLayer [Linear + BN + ReLU]  →  z ∈ R^k  (Stage 2 input)
+      │
+      ▼
+    ClassifierHead [Linear(k → 1)]  →  raw logit  (training only)
+
+    Parameters
+    ----------
+    input_dim : int
+        Dimensionality of the input feature vector (must match the output
+        of ``preprocessing.py`` — typically 37 for the Credit Card dataset).
+    hidden_dims : List[int], default [256, 128, 64]
+        Width of each hidden DenseBlock.  The paper specifies "three to
+        five fully connected hidden layers."
+    embedding_dim : int, default 32
+        Dimensionality of the latent embedding z.  This is the input size
+        for the XGBoost/LightGBM ensemble head (ensemble.py).
+    dropout : float, default 0.3
+        Dropout probability applied after each hidden layer's ReLU.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: List[int] = DEFAULT_HIDDEN_DIMS,
+        embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+        dropout: float = DEFAULT_DROPOUT,
+    ) -> None:
+        super().__init__()
+
+        if len(hidden_dims) < 1:
+            raise ValueError("hidden_dims must have at least one element.")
+        if not 1 <= len(hidden_dims) <= 5:
+            logger.warning(
+                "Paper specifies 3–5 hidden layers; got %d.", len(hidden_dims)
+            )
+
+        self.input_dim     = input_dim
+        self.hidden_dims   = list(hidden_dims)
+        self.embedding_dim = embedding_dim
+        self.dropout       = dropout
+
+        # ── Hidden layers ─────────────────────────────────────────────────────
+        blocks     = []
+        prev_dim   = input_dim
+        for h_dim in hidden_dims:
+            blocks.append(_DenseBlock(prev_dim, h_dim, dropout))
+            prev_dim = h_dim
+        self.hidden_layers = nn.Sequential(*blocks)
+
+        # ── Embedding layer (penultimate) — produces z ────────────────────────
+        # Paper: "The second to last hidden layer produces an embedding of each
+        # transaction, but it is compact, containing high level abstractions."
+        self.embedding_layer = nn.Sequential(
+            nn.Linear(prev_dim, embedding_dim, bias=False),
+            nn.BatchNorm1d(embedding_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # ── Classification head (training only) ───────────────────────────────
+        # Removed at inference; SHAP runs on the ensemble (Stage 2), not here.
+        self.classifier_head = nn.Linear(embedding_dim, 1)
+
+        # ── Weight initialisation (Kaiming / He) ──────────────────────────────
+        self._init_weights()
+
+        logger.info(
+            "FraudDNNEncoder built.  input=%d  hidden=%s  embedding=%d  "
+            "dropout=%.2f  params=%s",
+            input_dim,
+            hidden_dims,
+            embedding_dim,
+            dropout,
+            f"{self._count_params():,}",
+        )
+
+    # ── Forward passes ────────────────────────────────────────────────────────
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Full forward pass: raw features → logit (for training).
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (B, input_dim)
+            Batch of scaled input feature vectors.
+
+        Returns
+        -------
+        torch.Tensor, shape (B, 1)
+            Raw (pre-sigmoid) logit for the fraud class.
+        """
+        z = self.encode(x)
+        return self.classifier_head(z)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract the latent embedding z — the Stage 2 input.
+
+        This is the primary method called by ``ensemble.py`` after training
+        to obtain the embedding vectors passed to XGBoost/LightGBM.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (B, input_dim)
+            Batch of scaled input feature vectors.
+
+        Returns
+        -------
+        torch.Tensor, shape (B, embedding_dim)
+            Latent embedding z = φ_θ(x).
+        """
+        h = self.hidden_layers(x)
+        z = self.embedding_layer(h)
+        return z
+
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Return sigmoid fraud probabilities (for standalone DNN evaluation).
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (B, input_dim)
+
+        Returns
+        -------
+        torch.Tensor, shape (B,)
+            Fraud probability p̂ ∈ (0, 1) for each transaction.
+        """
+        return torch.sigmoid(self.forward(x)).squeeze()
+
+    # ── Batch embedding extraction (numpy in / numpy out) ────────────────────
+
+    @torch.no_grad()
+    def extract_embeddings(
+        self,
+        X: np.ndarray,
+        batch_size: int = 4096,
+        device: Optional[torch.device] = None,
+    ) -> np.ndarray:
+        """Extract embeddings for a full dataset in batches.
+
+        Convenience wrapper that handles device placement, batch iteration,
+        and conversion back to numpy.  Call this after training to get the
+        embedding matrix Z passed to ``ensemble.py``.
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (N, input_dim)
+            Scaled feature matrix (output of FoldPreprocessor).
+        batch_size : int, default 4096
+            Number of rows processed per forward pass.  Increase for speed
+            on GPU; decrease if you hit out-of-memory errors.
+        device : torch.device, optional
+            Target device.  Defaults to the device of the model's first
+            parameter.
+
+        Returns
+        -------
+        np.ndarray, shape (N, embedding_dim)
+            Embedding matrix Z where row i is z_i = φ_θ(x_i).
+
+        Examples
+        --------
+        >>> Z_train = model.extract_embeddings(X_train)
+        >>> Z_val   = model.extract_embeddings(X_val)
+        >>> # Now train XGBoost on Z_train, evaluate on Z_val
+        """
+        if device is None:
+            device = next(self.parameters()).device
+
+        self.eval()
+        parts: List[np.ndarray] = []
+        X_tensor = torch.from_numpy(X.astype(np.float32))
+
+        for start in range(0, len(X), batch_size):
+            batch = X_tensor[start : start + batch_size].to(device)
+            z     = self.encode(batch).cpu().numpy()
+            parts.append(z)
+
+        return np.vstack(parts)
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def save(self, path: str | Path) -> None:
+        """Save model weights and construction hyperparameters to disk.
+
+        Saves both the ``state_dict`` (weights) *and* the constructor
+        arguments so that :meth:`load` can reconstruct the exact
+        architecture without the caller needing to remember the
+        hyperparameters.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination ``.pt`` file, e.g. ``results/models/dnn_fold0.pt``.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "state_dict"   : self.state_dict(),
+                "input_dim"    : self.input_dim,
+                "hidden_dims"  : self.hidden_dims,
+                "embedding_dim": self.embedding_dim,
+                "dropout"      : self.dropout,
+            },
+            path,
+        )
+        logger.info("Model saved to %s", path)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        device: Optional[torch.device] = None,
+        # Kept for backwards-compat; ignored when checkpoint stores hparams
+        input_dim: Optional[int] = None,
+    ) -> "FraudDNNEncoder":
+        """Load a saved model from disk.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to a ``.pt`` file saved by :meth:`save`.
+        device : torch.device, optional
+            Device to load the model onto.  Defaults to CPU.
+        input_dim : int, optional
+            Ignored if the checkpoint stores architecture hyperparameters
+            (files saved with this version of the code).  Provided for
+            compatibility with older checkpoints that stored only
+            ``state_dict``.
+
+        Returns
+        -------
+        FraudDNNEncoder
+            Reconstructed model in eval mode.
+        """
+        if device is None:
+            device = torch.device("cpu")
+
+        checkpoint = torch.load(path, map_location=device)
+
+        if "input_dim" in checkpoint:
+            # New-style checkpoint: hyperparams stored alongside weights
+            model = cls(
+                input_dim    = checkpoint["input_dim"],
+                hidden_dims  = checkpoint["hidden_dims"],
+                embedding_dim= checkpoint["embedding_dim"],
+                dropout      = checkpoint["dropout"],
+            )
+        else:
+            # Legacy checkpoint: state_dict only
+            if input_dim is None:
+                raise ValueError(
+                    "This checkpoint does not store architecture hyperparameters. "
+                    "Pass input_dim explicitly."
+                )
+            model = cls(input_dim=input_dim)
+
+        model.load_state_dict(checkpoint["state_dict"])
+        model.to(device)
+        model.eval()
+        logger.info("Model loaded from %s  (device=%s)", path, device)
+        return model
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _init_weights(self) -> None:
+        """Initialise Linear layers with Kaiming uniform (He initialisation).
+
+        Kaiming initialisation is the standard choice for networks with
+        ReLU activations; it keeps the variance of activations constant
+        across layers, which speeds up convergence.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def _count_params(self) -> int:
+        """Return the total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def __repr__(self) -> str:
+        return (
+            f"FraudDNNEncoder("
+            f"input={self.input_dim}, "
+            f"hidden={self.hidden_dims}, "
+            f"embedding={self.embedding_dim}, "
+            f"dropout={self.dropout}, "
+            f"params={self._count_params():,})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Training history dataclass
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class TrainingHistory:
+    """Container for per-epoch metrics recorded during :func:`train_one_fold`.
+
+    Attributes
+    ----------
+    train_loss : List[float]
+        Mean focal loss per epoch over all training batches.
+    val_roc_auc : List[float]
+        Validation ROC-AUC after each epoch.
+    val_pr_auc : List[float]
+        Validation PR-AUC after each epoch (primary metric for imbalanced data).
+    best_epoch : int
+        Epoch index (0-based) at which the best val_pr_auc was recorded.
+    training_time_s : float
+        Wall-clock seconds elapsed for the full training run.
+    """
+
+    train_loss     : List[float] = field(default_factory=list)
+    val_roc_auc    : List[float] = field(default_factory=list)
+    val_pr_auc     : List[float] = field(default_factory=list)
+    best_epoch     : int         = 0
+    training_time_s: float       = 0.0
+
+    @property
+    def best_val_pr_auc(self) -> float:
+        """PR-AUC at the best epoch."""
+        return self.val_pr_auc[self.best_epoch] if self.val_pr_auc else 0.0
+
+    @property
+    def best_val_roc_auc(self) -> float:
+        """ROC-AUC at the best epoch."""
+        return self.val_roc_auc[self.best_epoch] if self.val_roc_auc else 0.0
+
+    def summary(self) -> str:
+        """One-line summary string for logging."""
+        return (
+            f"Epochs={len(self.train_loss)}  "
+            f"BestEpoch={self.best_epoch + 1}  "
+            f"BestPR-AUC={self.best_val_pr_auc:.4f}  "
+            f"BestROC-AUC={self.best_val_roc_auc:.4f}  "
+            f"Time={self.training_time_s:.1f}s"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Training loop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def train_one_fold(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    input_dim: int,
+    hidden_dims: List[int] = DEFAULT_HIDDEN_DIMS,
+    embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+    dropout: float = DEFAULT_DROPOUT,
+    focal_alpha: float = DEFAULT_FOCAL_ALPHA,
+    focal_gamma: float = DEFAULT_FOCAL_GAMMA,
+    lr: float = DEFAULT_LR,
+    weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    epochs: int = DEFAULT_EPOCHS,
+    patience: int = DEFAULT_PATIENCE,
+    device: Optional[torch.device] = None,
+    log_every: int = 10,
+) -> Tuple[FraudDNNEncoder, TrainingHistory]:
+    """Train the DNN encoder for a single cross-validation fold.
+
+    Implements the training procedure described in the paper:
+        "The DNN is trained on the processed transaction data with binary
+        cross-entropy loss and class weights, which are able to overcome
+        the imbalance.  The Adam optimizer is used to perform optimization
+        and early stopping is used to avoid overfitting."
+
+    The primary metric for early stopping and model selection is
+    **PR-AUC** (not ROC-AUC), because PR-AUC is more informative under
+    extreme class imbalance — a model can achieve high ROC-AUC while
+    still missing most fraud cases (the paper explicitly notes this in
+    the Results Discussion section).
+
+    Parameters
+    ----------
+    X_train : np.ndarray, shape (N_train, input_dim)
+        SMOTE-augmented, scaled training features (from FoldPreprocessor).
+    y_train : np.ndarray, shape (N_train,)
+        Binary training labels (0 = legitimate, 1 = fraud).
+    X_val : np.ndarray, shape (N_val, input_dim)
+        Scaled validation features (not resampled).
+    y_val : np.ndarray, shape (N_val,)
+        Binary validation labels.
+    input_dim : int
+        Number of input features.  Must match ``X_train.shape[1]``.
+    hidden_dims : List[int]
+        Hidden layer widths.
+    embedding_dim : int
+        Latent embedding dimension (z).
+    dropout : float
+        Dropout probability.
+    focal_alpha : float
+        Focal loss α (minority class weight).
+    focal_gamma : float
+        Focal loss γ (focusing parameter).
+    lr : float
+        Adam learning rate.
+    weight_decay : float
+        Adam L2 regularisation coefficient.
+    batch_size : int
+        Mini-batch size.
+    epochs : int
+        Maximum number of training epochs.
+    patience : int
+        Number of epochs with no improvement in val PR-AUC before
+        training is stopped early.
+    device : torch.device, optional
+        Training device.  Defaults to CUDA if available, else CPU.
+    log_every : int, default 10
+        Log training progress every *log_every* epochs.
+
+    Returns
+    -------
+    model : FraudDNNEncoder
+        The best model (weights from the epoch with highest val PR-AUC),
+        in eval mode, on CPU.
+    history : TrainingHistory
+        Per-epoch metrics and summary statistics.
+
+    Examples
+    --------
+    >>> model, history = train_one_fold(
+    ...     X_train, y_train, X_val, y_val, input_dim=37
+    ... )
+    >>> print(history.summary())
+    Epochs=34  BestEpoch=27  BestPR-AUC=0.9123  BestROC-AUC=0.9941  Time=48.3s
+    >>> Z_train = model.extract_embeddings(X_train)
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    logger.info(
+        "Training DNN encoder on device=%s  "
+        "train=%d  val=%d  epochs=%d  patience=%d",
+        device, len(X_train), len(X_val), epochs, patience,
+    )
+
+    # ── Model, loss, optimiser ────────────────────────────────────────────────
+    model = FraudDNNEncoder(
+        input_dim=input_dim,
+        hidden_dims=hidden_dims,
+        embedding_dim=embedding_dim,
+        dropout=dropout,
+    ).to(device)
+
+    criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # ReduceLROnPlateau — halve LR if val PR-AUC stalls for 3 epochs
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3, verbose=False
+    )
+
+    # ── DataLoader ────────────────────────────────────────────────────────────
+    X_tr_t = torch.from_numpy(X_train.astype(np.float32))
+    y_tr_t = torch.from_numpy(y_train.astype(np.float32))
+    X_vl_t = torch.from_numpy(X_val.astype(np.float32)).to(device)
+    y_vl_np = y_val  # kept as numpy for sklearn metrics
+
+    loader = DataLoader(
+        TensorDataset(X_tr_t, y_tr_t),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    history          = TrainingHistory()
+    best_pr_auc      = -1.0
+    patience_counter = 0
+    best_state_dict: Dict = {}
+    t0 = time.perf_counter()
+
+    for epoch in range(epochs):
+        # ── Train ─────────────────────────────────────────────────────────────
+        model.train()
+        epoch_loss = 0.0
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(X_batch)
+            loss   = criterion(logits, y_batch)
+            loss.backward()
+
+            # Gradient clipping — prevents exploding gradients with focal loss
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(loader)
+
+        # ── Validate ──────────────────────────────────────────────────────────
+        model.eval()
+        with torch.no_grad():
+            val_probs = model.predict_proba(X_vl_t).cpu().numpy()
+
+        val_roc_auc = roc_auc_score(y_vl_np, val_probs)
+        val_pr_auc  = average_precision_score(y_vl_np, val_probs)
+
+        history.train_loss.append(avg_loss)
+        history.val_roc_auc.append(val_roc_auc)
+        history.val_pr_auc.append(val_pr_auc)
+
+        scheduler.step(val_pr_auc)
+
+        # ── Early stopping on PR-AUC ──────────────────────────────────────────
+        if val_pr_auc > best_pr_auc:
+            best_pr_auc      = val_pr_auc
+            history.best_epoch = epoch
+            patience_counter  = 0
+            # Deep-copy weights to CPU to avoid device issues later
+            best_state_dict   = {
+                k: v.cpu().clone() for k, v in model.state_dict().items()
+            }
+        else:
+            patience_counter += 1
+
+        if (epoch + 1) % log_every == 0 or patience_counter == patience:
+            logger.info(
+                "  Epoch %3d/%d  loss=%.4f  val_PR-AUC=%.4f  val_ROC-AUC=%.4f  "
+                "patience=%d/%d",
+                epoch + 1, epochs,
+                avg_loss, val_pr_auc, val_roc_auc,
+                patience_counter, patience,
+            )
+
+        if patience_counter >= patience:
+            logger.info("Early stopping triggered at epoch %d.", epoch + 1)
+            break
+
+    # ── Restore best weights ──────────────────────────────────────────────────
+    model.load_state_dict(best_state_dict)
+    model.cpu()
+    model.eval()
+
+    history.training_time_s = time.perf_counter() - t0
+    logger.info("Training complete.  %s", history.summary())
+
+    return model, history
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-fold training (full cross-validation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def train_all_folds(
+    fold_data: List[dict],
+    input_dim: int,
+    save_dir: Optional[str | Path] = None,
+    **kwargs,
+) -> Tuple[List[FraudDNNEncoder], List[TrainingHistory]]:
+    """Train the DNN encoder across all cross-validation folds.
+
+    Iterates over the output of ``preprocessing.run_pipeline()`` and calls
+    :func:`train_one_fold` for each fold, optionally saving each trained
+    model to *save_dir*.
+
+    Parameters
+    ----------
+    fold_data : List[dict]
+        List of dicts with keys ``X_train``, ``y_train``, ``X_val``,
+        ``y_val``.  Typically the first return value of
+        ``preprocessing.run_pipeline()``.
+    input_dim : int
+        Number of input features (must match ``X_train.shape[1]``).
+    save_dir : str or Path, optional
+        If provided, each trained model is saved as
+        ``{save_dir}/dnn_fold{k}.pt``.
+    **kwargs
+        Additional keyword arguments forwarded to :func:`train_one_fold`
+        (e.g. ``embedding_dim``, ``epochs``, ``patience``).
+
+    Returns
+    -------
+    models : List[FraudDNNEncoder]
+        One trained encoder per fold.
+    histories : List[TrainingHistory]
+        One history object per fold.
+
+    Examples
+    --------
+    >>> from src.preprocessing import run_pipeline
+    >>> fold_data, feature_cols = run_pipeline("data/creditcard.csv")
+    >>> models, histories = train_all_folds(
+    ...     fold_data, input_dim=len(feature_cols),
+    ...     save_dir="results/models"
+    ... )
+    >>> for k, h in enumerate(histories):
+    ...     print(f"Fold {k+1}: {h.summary()}")
+    """
+    models: List[FraudDNNEncoder]    = []
+    histories: List[TrainingHistory] = []
+
+    for fold_idx, fold in enumerate(fold_data):
+        logger.info("═══ DNN Fold %d/%d ═══", fold_idx + 1, len(fold_data))
+
+        model, history = train_one_fold(
+            X_train   = fold["X_train"],
+            y_train   = fold["y_train"],
+            X_val     = fold["X_val"],
+            y_val     = fold["y_val"],
+            input_dim = input_dim,
+            **kwargs,
+        )
+        models.append(model)
+        histories.append(history)
+
+        if save_dir is not None:
+            save_path = Path(save_dir) / f"dnn_fold{fold_idx}.pt"
+            model.save(save_path)
+
+    # Print cross-fold summary
+    pr_aucs = [h.best_val_pr_auc for h in histories]
+    logger.info(
+        "All folds complete.  PR-AUC per fold: %s  Mean=%.4f ± %.4f",
+        [f"{v:.4f}" for v in pr_aucs],
+        np.mean(pr_aucs),
+        np.std(pr_aucs),
+    )
+
+    return models, histories
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+if __name__ == "__main__":
+    import argparse
+    import joblib
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Train the DNN encoder (Stage 1) for the hybrid fraud detection pipeline."
+    )
+    parser.add_argument(
+        "--processed-dir",
+        type=str,
+        default="data/processed",
+        help="Directory containing fold_data.pkl and feature_cols.pkl "
+             "(output of preprocessing.py).",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default="results/models",
+        help="Directory to save trained .pt model files.",
+    )
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=DEFAULT_EMBEDDING_DIM,
+        help=f"Latent embedding dimension z (default: {DEFAULT_EMBEDDING_DIM}).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_EPOCHS,
+        help=f"Maximum training epochs per fold (default: {DEFAULT_EPOCHS}).",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=DEFAULT_PATIENCE,
+        help=f"Early stopping patience (default: {DEFAULT_PATIENCE}).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Mini-batch size (default: {DEFAULT_BATCH_SIZE}).",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=DEFAULT_LR,
+        help=f"Adam learning rate (default: {DEFAULT_LR}).",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=DEFAULT_DROPOUT,
+        help=f"Dropout probability (default: {DEFAULT_DROPOUT}).",
+    )
+    args = parser.parse_args()
+
+    processed_dir = Path(args.processed_dir)
+    fold_data     = joblib.load(processed_dir / "fold_data.pkl")
+    feature_cols  = joblib.load(processed_dir / "feature_cols.pkl")
+    input_dim     = len(feature_cols)
+
+    print(f"Loaded {len(fold_data)} folds  |  {input_dim} features")
+
+    models, histories = train_all_folds(
+        fold_data     = fold_data,
+        input_dim     = input_dim,
+        save_dir      = args.save_dir,
+        embedding_dim = args.embedding_dim,
+        epochs        = args.epochs,
+        patience      = args.patience,
+        batch_size    = args.batch_size,
+        lr            = args.lr,
+        dropout       = args.dropout,
+    )
+
+    print(f"\nDone.  Models saved to {args.save_dir}/")
+    for k, h in enumerate(histories):
+        print(f"  Fold {k+1}: {h.summary()}")
